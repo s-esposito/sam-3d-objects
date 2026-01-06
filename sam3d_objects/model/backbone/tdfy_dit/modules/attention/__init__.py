@@ -12,7 +12,8 @@ def __from_env():
     global BACKEND
     global DEBUG
 
-    env_attn_backend = os.environ.get("ATTN_BACKEND")
+    # env_attn_backend = "sdpa" # os.environ.get("ATTN_BACKEND")
+    env_attn_backend = "xformers"
     env_sttn_debug = os.environ.get("ATTN_DEBUG")
 
     if env_attn_backend is not None and env_attn_backend in [
@@ -36,11 +37,13 @@ __from_env()
 def set_backend(backend: Literal["xformers", "flash_attn", "torch_flash_attn"]):
     global BACKEND
     BACKEND = backend
+    print(f"[ATTENTION] Using backend: {BACKEND}")
 
 
 def set_debug(debug: bool):
     global DEBUG
     DEBUG = debug
+    print(f"[ATTENTION] Debug mode: {DEBUG}")
 
 
 from .full_attn import *

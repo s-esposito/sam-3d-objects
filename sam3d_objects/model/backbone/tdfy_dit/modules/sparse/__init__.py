@@ -17,7 +17,8 @@ def __from_env():
 
     env_sparse_backend = os.environ.get("SPARSE_BACKEND")
     env_sparse_debug = os.environ.get("SPARSE_DEBUG")
-    env_sparse_attn = os.environ.get("SPARSE_ATTN_BACKEND")
+    # env_sparse_attn = "sdpa" # os.environ.get("SPARSE_ATTN_BACKEND")
+    env_sparse_attn = "xformers"
     if env_sparse_attn is None:
         env_sparse_attn = os.environ.get("ATTN_BACKEND")
 
@@ -45,11 +46,13 @@ __from_env()
 def set_backend(backend: Literal["spconv", "torchsparse"]):
     global BACKEND
     BACKEND = backend
+    print(f"[SPARSE] Using backend: {BACKEND}")
 
 
 def set_debug(debug: bool):
     global DEBUG
     DEBUG = debug
+    print(f"[SPARSE] Debug mode: {DEBUG}")
 
 
 def set_attn(attn: Literal["xformers", "flash_attn"]):

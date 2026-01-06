@@ -22,8 +22,8 @@ import numpy as np
 import gradio as gr
 import matplotlib.pyplot as plt
 from copy import deepcopy
-from kaolin.visualize import IpyTurntableVisualizer
-from kaolin.render.camera import Camera, CameraExtrinsics, PinholeIntrinsics
+# from kaolin.visualize import IpyTurntableVisualizer
+# from kaolin.render.camera import Camera, CameraExtrinsics, PinholeIntrinsics
 import builtins
 from pytorch3d.transforms import quaternion_multiply, quaternion_invert
 
