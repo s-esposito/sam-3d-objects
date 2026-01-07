@@ -341,10 +341,11 @@ def check_hydra_safety(
             to_check.extend(list(node))
 
 
-def load_image(path):
+def load_image(path, to_uint8=True):
     image = Image.open(path)
     image = np.array(image)
-    image = image.astype(np.uint8)
+    if to_uint8:
+        image = image.astype(np.uint8)
     return image
 
 

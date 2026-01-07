@@ -54,3 +54,6 @@ CUDA_HOME=/usr/local/cuda-12.1 TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=1 pip install
 ./patching/hydra # https://github.com/facebookresearch/hydra/pull/2863
 
 pip install 'huggingface-hub[cli]<1.0'
+
+pip install open3d
+pip install xformers
