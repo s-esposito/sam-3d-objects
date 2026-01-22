@@ -11,7 +11,8 @@ import torch
 
 from utils import (
     load_image,
-    create_gaussians_from_depth,
+    depth_to_pointmap,
+    create_gaussians_from_pointmap,
     render_frame,
     radial_to_z_depth,
 )
@@ -55,14 +56,11 @@ def main():
     
     # Create Gaussians
     output_path = "gaussians.ply"
-    gaussians = create_gaussians_from_depth(
+    pointmap = depth_to_pointmap(depth_map_z, K_matrix)
+    gaussians = create_gaussians_from_pointmap(
         image=image,
-        depth=depth_map_z,
-        fx=fx,
-        fy=fy,
-        cx=cx,
-        cy=cy,
-        normalize_depth=False,
+        pointmap=pointmap,
+        K=K_matrix,
         output_path=output_path,
     )
     

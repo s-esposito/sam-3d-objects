@@ -15,6 +15,73 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.gaussian_model import Gaussian
 
+
+def save_mesh_to_obj(mesh, output_path):
+    """
+    Save a mesh object to an OBJ file.
+    
+    Parameters
+    ----------
+    mesh : MeshExtractResult or similar
+        Mesh object with vertices, faces, and optionally vertex_attrs attributes.
+        vertices should be (N, 3) tensor
+        faces should be (M, 3) tensor
+        vertex_attrs can be:
+          - A tensor of shape (N, C) where C >= 3 (first 3 channels are RGB color)
+          - A dict with 'color' key
+          - None
+    output_path : str
+        Path to save the OBJ file
+    """
+    # Handle both 'vertices' and 'verts' attribute names
+    if hasattr(mesh, 'vertices'):
+        verts = mesh.vertices.cpu().numpy() if hasattr(mesh.vertices, 'cpu') else mesh.vertices
+    elif hasattr(mesh, 'verts'):
+        verts = mesh.verts.cpu().numpy() if hasattr(mesh.verts, 'cpu') else mesh.verts
+    else:
+        raise AttributeError("Mesh object has no 'vertices' or 'verts' attribute")
+    
+    faces = mesh.faces.cpu().numpy() if hasattr(mesh.faces, 'cpu') else mesh.faces
+    
+    # Check for vertex colors
+    vertex_colors = None
+    if hasattr(mesh, 'vertex_attrs') and mesh.vertex_attrs is not None:
+        va = mesh.vertex_attrs
+        # vertex_attrs can be a tensor directly or a dict
+        if isinstance(va, dict):
+            if 'color' in va:
+                vc = va['color']
+                vertex_colors = vc.cpu().numpy() if hasattr(vc, 'cpu') else vc
+        elif hasattr(va, 'cpu'):
+            # It's a tensor - assume first 3 channels are RGB
+            va_np = va.cpu().numpy()
+            if va_np.shape[-1] >= 3:
+                vertex_colors = va_np[..., :3]
+        elif isinstance(va, np.ndarray):
+            if va.shape[-1] >= 3:
+                vertex_colors = va[..., :3]
+    elif hasattr(mesh, 'vertex_colors') and mesh.vertex_colors is not None:
+        vertex_colors = mesh.vertex_colors.cpu().numpy() if hasattr(mesh.vertex_colors, 'cpu') else mesh.vertex_colors
+    
+    with open(output_path, 'w') as f:
+        f.write(f"# OBJ file with {len(verts)} vertices and {len(faces)} faces\n")
+        
+        # Write vertices (with colors if available)
+        for i, v in enumerate(verts):
+            if vertex_colors is not None:
+                c = vertex_colors[i]
+                # Clamp colors to [0, 1]
+                c = np.clip(c, 0, 1)
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}\n")
+            else:
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        
+        # Write faces (OBJ uses 1-indexed vertices)
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+    
+    print(f"Saved mesh to {output_path} ({len(verts)} vertices, {len(faces)} faces)")
+
 C0 = 0.28209479177387814
 
 def RGB2SH(rgb):
@@ -360,7 +427,7 @@ def create_gaussians_object(
     scales_internal = gaussians.inverse_scaling_activation(scales)
     
     gaussians._scaling = scales_internal
-    gaussians._rotation = rots
+    gaussians._rotation = rots - gaussians.rots_bias[None, :]
     
     # Clamp opacities to avoid numerical issues with inverse_sigmoid at exactly 0 or 1
     opacities_clamped = torch.clamp(opacities, 1e-6, 1.0 - 1e-6)
@@ -377,57 +444,157 @@ def create_gaussians_object(
     
     return gaussians
 
-def create_gaussians_from_depth(
-    image: np.ndarray,
-    depth: np.ndarray,
-    fx: float,
-    fy: float,
-    cx: float,
-    cy: float,
-    normalize_depth: bool = False,
-    output_path: str = None,
-) -> Gaussian:
+
+# def create_gaussians_object(
+#     xyz: torch.Tensor,
+#     features: torch.Tensor,
+#     scales: torch.Tensor,
+#     rots: torch.Tensor,
+#     opacities: torch.Tensor,
+# ) -> Gaussian:
+#     # Compute AABB (axis-aligned bounding box) from the pointmap
+#     # Format: [min_x, min_y, min_z, size_x, size_y, size_z]
+#     xyz_min = xyz.min(dim=0)[0]
+#     xyz_max = xyz.max(dim=0)[0]
+#     xyz_size = xyz_max - xyz_min
+#     aabb = torch.cat([xyz_min, xyz_size]).tolist()
+#     print(f"Computed AABB: {aabb}")
+#     print(f"  Min: [{xyz_min[0]:.4f}, {xyz_min[1]:.4f}, {xyz_min[2]:.4f}]")
+#     print(f"  Max: [{xyz_max[0]:.4f}, {xyz_max[1]:.4f}, {xyz_max[2]:.4f}]")
+#     print(f"  Size: [{xyz_size[0]:.4f}, {xyz_size[1]:.4f}, {xyz_size[2]:.4f}]")
+    
+#     # Normalize xyz to [0, 1] range for internal storage
+#     # The Gaussian model expects normalized coordinates and will denormalize using AABB
+#     xyz_normalized = (xyz - xyz_min) / xyz_size
+#     print(f"Normalized xyz: min={xyz_normalized.min():.6f}, max={xyz_normalized.max():.6f}")
+    
+    
+#     print(f"Converted RGB to SH features: min={features.min():.6f}, max={features.max():.6f}")
+
+#     # Create Gaussian model with computed AABB
+#     gaussians = Gaussian(aabb=aabb, scaling_bias=0.0, opacity_bias=0.0)
+    
+#     # Move all tensors to CUDA
+#     device = 'cuda'
+#     xyz_normalized = xyz_normalized.to(device)
+#     features = features.to(device)
+#     scales = scales.to(device)
+#     rots = rots.to(device)
+#     opacities = opacities.to(device)
+    
+#     # Initialize gaussians with the computed values
+#     gaussians._xyz = xyz_normalized  # Use normalized coordinates!
+#     gaussians._features_dc = features
+    
+#     # Disable scale_bias and opacity_bias, move to correct device
+#     gaussians.scale_bias = torch.tensor(0.0, device=gaussians._xyz.device)
+#     gaussians.opacity_bias = torch.tensor(0.0, device=gaussians._xyz.device)
+    
+#     # Debug: check scaling before and after inverse activation
+#     scales_internal = gaussians.inverse_scaling_activation(scales)
+    
+#     gaussians._scaling = scales_internal
+#     gaussians._rotation = rots
+    
+#     # Clamp opacities to avoid numerical issues with inverse_sigmoid at exactly 0 or 1
+#     opacities_clamped = torch.clamp(opacities, 1e-6, 1.0 - 1e-6)
+#     opacities_internal = gaussians.inverse_opacity_activation(opacities_clamped)
+    
+#     gaussians._opacity = opacities_internal
+    
+#     print(f"\nGaussians initialized on device: {gaussians._xyz.device}")
+#     print(f"AABB device: {gaussians.aabb.device}")
+#     print(f"\nfeatures shape: {gaussians.get_features.shape}, min: {gaussians.get_features.min().item():.3f}, max: {gaussians.get_features.max().item():.3f}")
+#     print(f"opacities shape: {gaussians.get_opacity.shape}, min: {gaussians.get_opacity.min().item():.3f}, max: {gaussians.get_opacity.max().item():.3f}")
+#     print(f"scaling shape: {gaussians.get_scaling.shape}, min: {gaussians.get_scaling.min().item():.6f}, max: {gaussians.get_scaling.max().item():.6f}")
+#     print(f"rotation shape: {gaussians.get_rotation.shape}, min: {gaussians.get_rotation.min().item():.3f}, max: {gaussians.get_rotation.max().item():.3f}")
+    
+#     return gaussians
+
+
+def join_gaussians(*gaussian_objects: Gaussian) -> Gaussian:
     """
-    Create Gaussian splats from depth map and RGB image.
+    Join multiple Gaussian objects into a single combined Gaussian object.
+    
+    Args:
+        *gaussian_objects: Variable number of Gaussian objects to combine
+        
+    Returns:
+        Combined Gaussian object containing all gaussians from input objects
+    """
+    if len(gaussian_objects) == 0:
+        raise ValueError("At least one Gaussian object must be provided")
+    
+    if len(gaussian_objects) == 1:
+        return gaussian_objects[0]
+    
+    # Collect all properties from each Gaussian object
+    all_xyz = []
+    all_features = []
+    all_scales = []
+    all_rots = []
+    all_opacities = []
+    
+    for gs in gaussian_objects:
+        all_xyz.append(gs.get_xyz)
+        all_features.append(gs.get_features)
+        all_scales.append(gs.get_scaling)
+        all_rots.append(gs.get_rotation)
+        all_opacities.append(gs.get_opacity)
+    
+    # Concatenate all properties
+    combined_xyz = torch.cat(all_xyz, dim=0)
+    combined_features = torch.cat(all_features, dim=0)
+    combined_scales = torch.cat(all_scales, dim=0)
+    combined_rots = torch.cat(all_rots, dim=0)
+    combined_opacities = torch.cat(all_opacities, dim=0)
+    
+    # Create new combined Gaussian object
+    combined_gs = create_gaussians_object(
+        xyz=combined_xyz,
+        features=combined_features,
+        scales=combined_scales,
+        rots=combined_rots,
+        opacities=combined_opacities,
+    )
+    
+    return combined_gs
+
+
+def depth_to_pointmap(
+    depth_map: np.ndarray,
+    K: np.ndarray,
+    normalize_depth: bool = False,
+    valid_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Convert depth map to 3D pointmap using camera intrinsics.
     
     Parameters
     ----------
-    image : np.ndarray
-        RGB image as a NumPy array
-    depth : np.ndarray
+    depth_map : np.ndarray
         Depth map as a NumPy array
     fx, fy : float
         Focal lengths in pixels
     cx, cy : float
         Principal point coordinates
-    normalize_depth : bool
-        Whether to normalize depth to [0, 1]
-    output_path : str, optional
-        Path to save the Gaussian PLY file
         
     Returns
     -------
-    Gaussian
-        The created Gaussian model
+    np.ndarray
+        Pointmap as a np.ndarray of shape (H, W, 3)
     """
-    # Load image
-    H, W, _ = image.shape
+    H, W = depth_map.shape[:2]
     
-    # Create intrinsics matrix
-    K_matrix = np.eye(3)
-    K_matrix[0, 0] = fx
-    K_matrix[1, 1] = fy
-    K_matrix[0, 2] = cx
-    K_matrix[1, 2] = cy
-    
-    # Load depth map
-    depth_map = depth
+    if valid_mask is not None:
+        # Set 2 * max_depth where ~valid_mask
+        depth_map[~valid_mask] = 2 * np.max(depth_map)
     
     # Normalize depth if requested
     if normalize_depth:
         depth_map = depth_map / depth_map.max()
     
-    print(f"Using camera intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
+    print(f"Using camera intrinsics: K={K}")
     print(f"Depth map with shape: {depth_map.shape}, dtype: {depth_map.dtype}, min: {depth_map.min()}, max: {depth_map.max()}")
     
     # Generate 3D point cloud from z-depth
@@ -436,17 +603,55 @@ def create_gaussians_from_depth(
     
     # Convert to 3D coordinates using pinhole camera model
     z = depth_map
-    x = (u_coords - cx) * z / fx
-    y = (v_coords - cy) * z / fy
+    x = (u_coords - K[0, 2]) * z / K[0, 0]
+    y = (v_coords - K[1, 2]) * z / K[1, 1]
     
-    points = np.stack((x, y, z), axis=-1)  # (H, W, 3)
-    pointmap = torch.from_numpy(points).float()  # (H, W, 3)
+    pointmap = np.stack((x, y, z), axis=-1)  # (H, W, 3)
     
     print(f"Generated pointmap with shape: {pointmap.shape}, min: {pointmap.min():.3f}, max: {pointmap.max():.3f}")
+    
+    return pointmap
+
+def create_gaussians_from_pointmap(
+    image: np.ndarray,
+    pointmap: np.ndarray,
+    K: np.ndarray,
+    output_path: str | None = None,
+    valid_mask: np.ndarray | None = None,
+) -> Gaussian:
+    """
+    Create Gaussian splats from pointmap and RGB image.
+    
+    Parameters
+    ----------
+    image : np.ndarray
+        RGB image as a NumPy array
+    pointmap : np.ndarray
+        Pointmap as a NumPy array of shape (H, W, 3)
+    K : np.ndarray
+        Camera intrinsics matrix
+    output_path : str | None, optional
+        Path to save the Gaussian PLY file
+        
+    Returns
+    -------
+    Gaussian
+        The created Gaussian model
+    """
+    # Load image
+    # H, W, _ = image.shape
+    
+    # Load depth map
+    depth_map = pointmap[..., 2]
+    
+    if valid_mask is not None:
+        # Set 2 * max_depth where ~valid_mask
+        depth_map[~valid_mask] = 2 * np.max(depth_map)
     
     # Create Gaussians from pointmap
     # Reshape pointmap to (N, 3)
     xyz = pointmap.reshape(-1, 3)
+    xyz = torch.from_numpy(xyz).float() # (N, 3)
     
     # Convert RGB to SH degree 0
     # SH0 = (RGB - 0.5) / C0, where C0 = 0.28209479177387814
@@ -456,7 +661,7 @@ def create_gaussians_from_depth(
     features = torch.from_numpy(features).float().unsqueeze(1)  # (N, 1, 3) for SH degree 0
     
     # Compute scales using _compute_conegs_scaling
-    K_torch = torch.from_numpy(K_matrix).float()
+    K_torch = torch.from_numpy(K).float()
     K_inv = torch.inverse(K_torch)
     
     # Get depth values (z-coordinate) from pointmap (in world coordinates)
@@ -498,3 +703,57 @@ def create_gaussians_from_depth(
         print(f"\nSaved Gaussians to: {output_path}")
     
     return gaussians
+
+
+def rerun_gaussian_decoder(inference_pipeline, decoder_input_slat, formats=["gaussian"]):
+    """
+    Re-run the Gaussian decoder forward pass using saved decoder inputs.
+    
+    This function allows you to reproduce the exact same Gaussians from cached
+    decoder inputs without re-running the entire inference pipeline (image encoder,
+    structure encoder, SLAT sampling, etc.).
+    
+    Parameters
+    ----------
+    inference_pipeline : InferencePipelinePointMap
+        The inference pipeline object that contains the decoder model
+    decoder_input_slat : sp.SparseTensor
+        The SLAT latent features (SparseTensor) from a previous inference run.
+        This is returned as output["decoder_input_slat"] from pipeline.run()
+    formats : list of str, optional
+        List of output formats to decode. Options: ["gaussian", "mesh", "gaussian_4"]
+        Default is ["gaussian"]
+        
+    Returns
+    -------
+    dict
+        Dictionary with decoded outputs, e.g., {"gaussian": [Gaussian object]}
+        
+    Example
+    -------
+    >>> # Run inference once and save decoder inputs
+    >>> output = pipeline.run(image, mask, pointmap_dict)
+    >>> slat = output["decoder_input_slat"]
+    >>> 
+    >>> # Later, re-run decoder to get same Gaussians
+    >>> from utils import rerun_gaussian_decoder
+    >>> decoded = rerun_gaussian_decoder(pipeline, slat, formats=["gaussian"])
+    >>> gaussians = decoded["gaussian"][0]  # Same as output["gaussian"][0]
+    >>> 
+    >>> # Can also decode to different formats
+    >>> decoded = rerun_gaussian_decoder(pipeline, slat, formats=["gaussian", "mesh"])
+    
+    Notes
+    -----
+    - The decoder inputs (slat) contain both the latent features and spatial coordinates
+    - This is much faster than re-running the full pipeline
+    - Useful for experimenting with decoder configurations or analyzing decoder behavior
+    - The output Gaussians will be identical to the original inference (bit-for-bit)
+    """
+    import torch
+    
+    # Run the decoder using the saved SLAT inputs
+    with torch.no_grad():
+        decoded_outputs = inference_pipeline.decode_slat(decoder_input_slat, formats=formats)
+    
+    return decoded_outputs
