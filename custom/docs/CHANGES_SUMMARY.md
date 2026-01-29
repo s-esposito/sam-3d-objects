@@ -47,10 +47,10 @@ if 'decoder_input_slat_feats' in data and 'decoder_input_slat_coords' in data:
 ```
 
 ### 3. `notebook/utils.py`
-**Change**: Added `rerun_gaussian_decoder()` function
+**Change**: Added `redecode_slat()` function
 
 ```python
-def rerun_gaussian_decoder(inference_pipeline, decoder_input_slat, formats=["gaussian"]):
+def redecode_slat(inference_pipeline, decoder_input_slat, formats=["gaussian"]):
     """Re-run the Gaussian decoder forward pass using saved decoder inputs."""
     with torch.no_grad():
         decoded_outputs = inference_pipeline.decode_slat(decoder_input_slat, formats=formats)
@@ -80,7 +80,7 @@ Added section on "Re-running the Decoder" with examples and use cases.
 ### Python API
 ```python
 from inference import Inference
-from utils import rerun_gaussian_decoder
+from utils import redecode_slat
 
 # Run inference once
 inference = Inference("checkpoints/hf/pipeline.yaml", compile=False)
@@ -90,7 +90,7 @@ output = inference(image, mask, pointmap=pointmap)
 slat = output["decoder_input_slat"]
 
 # Later, re-run decoder
-decoded = rerun_gaussian_decoder(inference._pipeline, slat, formats=["gaussian"])
+decoded = redecode_slat(inference._pipeline, slat, formats=["gaussian"])
 gaussians = decoded["gaussian"][0]  # Identical to output["gaussian"][0]
 ```
 

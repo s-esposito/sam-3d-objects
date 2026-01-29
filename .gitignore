@@ -8,3 +8,4 @@ __pycache__
 *.tar.bz2
 notebook/outputs/
 notebook/gaussians/
+custom/results/*

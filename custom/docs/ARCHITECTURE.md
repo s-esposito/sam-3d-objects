@@ -312,8 +312,8 @@ output = pipeline.run(image, mask, pointmap_dict)
 slat = output["decoder_input_slat"]
 
 # Later, re-run just the decoder to get the same Gaussians
-from utils import rerun_gaussian_decoder
-decoded = rerun_gaussian_decoder(pipeline, slat, formats=["gaussian"])
+from utils import redecode_slat
+decoded = redecode_slat(pipeline, slat, formats=["gaussian"])
 gaussians = decoded["gaussian"][0]  # Same as output["gaussian"][0]
 ```
 

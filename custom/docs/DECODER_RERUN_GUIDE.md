@@ -42,10 +42,10 @@ coords = output["decoder_input_coords"]
 ### Step 2: Re-run Decoder
 
 ```python
-from utils import rerun_gaussian_decoder
+from utils import redecode_slat
 
 # Re-run decoder with saved inputs
-decoded = rerun_gaussian_decoder(
+decoded = redecode_slat(
     inference._pipeline,  # The pipeline object
     slat,                 # The saved SLAT features
     formats=["gaussian"]  # Output formats
@@ -113,7 +113,7 @@ python notebook/rerun_decoder_example.py \
    - `load_cached_results()`: Reconstructs SparseTensor from saved data
 
 3. **`notebook/utils.py`**
-   - `rerun_gaussian_decoder()`: Helper function to re-run decoder
+   - `redecode_slat()`: Helper function to re-run decoder
 
 4. **`notebook/rerun_decoder_example.py`** (NEW)
    - Standalone script for re-running decoder from cache
@@ -131,16 +131,16 @@ output = inference(image, mask, pointmap=pointmap)
 slat = output["decoder_input_slat"]
 
 # Try different decoder formats quickly
-mesh_output = rerun_gaussian_decoder(pipeline, slat, formats=["mesh"])
-gaussian_output = rerun_gaussian_decoder(pipeline, slat, formats=["gaussian"])
+mesh_output = redecode_slat(pipeline, slat, formats=["mesh"])
+gaussian_output = redecode_slat(pipeline, slat, formats=["gaussian"])
 ```
 
 ### Decoder Analysis
 Study decoder behavior with fixed inputs:
 ```python
 # Same inputs, different random seeds (if applicable)
-decoded_1 = rerun_gaussian_decoder(pipeline, slat, formats=["gaussian"])
-decoded_2 = rerun_gaussian_decoder(pipeline, slat, formats=["gaussian"])
+decoded_1 = redecode_slat(pipeline, slat, formats=["gaussian"])
+decoded_2 = redecode_slat(pipeline, slat, formats=["gaussian"])
 
 # Compare outputs
 diff = (decoded_1["gaussian"][0].get_xyz - decoded_2["gaussian"][0].get_xyz).abs().max()
@@ -155,7 +155,7 @@ cached_outputs = load_cached_results(cache_path, scene_name)
 slat = cached_outputs[0]["decoder_input_slat"]
 
 # Get exact same Gaussians
-decoded = rerun_gaussian_decoder(pipeline, slat, formats=["gaussian"])
+decoded = redecode_slat(pipeline, slat, formats=["gaussian"])
 ```
 
 ## Performance
@@ -230,4 +230,4 @@ The re-decoded Gaussians should be **bit-for-bit identical** to the original. If
 
 - **ARCHITECTURE.md**: Full pipeline architecture documentation
 - **demo.py**: Main inference script with caching
-- **utils.py**: Helper functions including `rerun_gaussian_decoder()`
+- **utils.py**: Helper functions including `redecode_slat()`
