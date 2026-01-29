@@ -55,7 +55,7 @@ from pytorch3d.renderer import (
     TexturesVertex,
 )
 from pytorch3d.io import load_objs_as_meshes, load_ply
-from utils import render_frame
+from utils import render_gaussians_scene
 
 
 def load_gaussian_ply(ply_path):
@@ -154,7 +154,7 @@ def render_gaussian_from_view(gaussian, R, T, image_size=512, fov=60):
     
     # Render using the utility function with white background
     white_bg = torch.ones(3, device=device)
-    rendered, alpha = render_frame(
+    rendered, alpha = render_gaussians_scene(
         gaussian,
         c2w=c2w,
         K=K,

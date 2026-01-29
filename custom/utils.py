@@ -6,12 +6,33 @@ import time
 import glob
 import torch
 import matplotlib.pyplot as plt
+from dataclasses import dataclass
 from PIL import Image
 from gsplat.rendering import rasterization
 from pytorch3d.transforms import Transform3d
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply
 from pytorch3d.renderer import look_at_view_transform
 from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert
+
+
+@dataclass
+class RefinementConfig:
+    """Configuration for pose refinement optimization."""
+    # Optimization iterations
+    num_iterations: int = 100
+    
+    # Learning rates
+    lr_rotation: float = 0.01
+    lr_translation: float = 0.001
+    lr_scale: float = 0.001
+    
+    # Loss weights
+    silhouette_weight: float = 0.1
+    regularization_weight: float = 0.001
+    
+    # Logging
+    verbose: bool = True
+    log_interval: int = 20
 
 
 # Skip sam3d_objects initialization for lightweight tools
@@ -307,7 +328,7 @@ def render_and_compare(scene_gs, image, K_matrix, W, H, output_path="rendered_vs
     c2w = torch.eye(4)
     K = torch.from_numpy(K_matrix).float()
     
-    rendered_frame, _ = render_frame(scene_gs, c2w=c2w, K=K, w=W, h=H)
+    rendered_frame, _ = render_gaussians_scene(scene_gs, c2w=c2w, K=K, w=W, h=H)
     
     # Create comparison visualization
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
@@ -545,13 +566,13 @@ def render_gaussians_to_image(scene_gs, K_matrix, W, H, bg_color=None):
     
     # Default to white background for evaluation
     if bg_color is None:
-        bg_color = torch.ones(3)
+        bg_color = torch.zeros(3)
     
-    rendered_frame, alpha = render_frame(scene_gs, c2w=c2w, K=K, w=W, h=H, bg_color=bg_color)
+    rendered_frame, alpha = render_gaussians_scene(scene_gs, c2w=c2w, K=K, w=W, h=H, bg_color=bg_color)
     
     return rendered_frame
 
-def render_frame(
+def render_gaussians_scene(
     scene_gs,
     c2w,  # Camera-to-world transformation (4, 4)
     K,    # Camera intrinsics (3, 3)
@@ -573,15 +594,15 @@ def render_frame(
         Rendered image as numpy array (H, W, 3) in uint8 format
     """
     
-    # Convert c2w to extrinsics (world-to-camera)
-    # Extrinsics = inverse(c2w)
-    w2c = torch.inverse(c2w.float())
-    
     # Ensure tensors are on CUDA
-    w2c = w2c.cuda() if not w2c.is_cuda else w2c
+    c2w = c2w.cuda() if not c2w.is_cuda else c2w
     Ks = K.cuda() if not K.is_cuda else K
-    w2c = w2c.unsqueeze(0)  # [1, 4, 4]
-    Ks = Ks.unsqueeze(0)    # [1, 3, 3]
+    
+    if c2w.dim() == 2:
+        c2w = c2w.unsqueeze(0)  # [1, 4, 4]
+    
+    if Ks.dim() == 2:
+        Ks = Ks.unsqueeze(0)    # [1, 3, 3]
     
     means = scene_gs.get_xyz  # [N, 3]
     rotations = scene_gs.get_rotation  # [N, 4]
@@ -590,44 +611,27 @@ def render_frame(
     features = scene_gs.get_features  # [N, 1, 3]
     width = w
     height = h
-    near_plane = 0.1
-    far_plane = 100000.0
-    
+
     # Set background color (default to black if not provided)
     if bg_color is None:
-        bg_color = torch.zeros(3, device=w2c.device)
+        bg_color = torch.zeros(3, device=c2w.device)
     else:
-        bg_color = bg_color.to(w2c.device)
+        bg_color = bg_color.to(c2w.device)
     
-    # Render
-    with torch.no_grad():
-        rgbd, alpha, info = rasterization(
-            means=means,  # [N, 3]
-            quats=rotations,  # [N, 4]
-            scales=scales,  # [N, 3]
-            opacities=opacity.squeeze(-1),  # [N]
-            colors=features,  # [N, 3]
-            viewmats=w2c,  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
-            width=width,
-            height=height,
-            near_plane=near_plane,
-            far_plane=far_plane,
-            render_mode="RGB",
-            sh_degree=0,
-            rasterize_mode="classic",
-            distributed=False,
-            camera_model="pinhole",
-            packed=False,
-            backgrounds=bg_color[None, ...],  # [1, 3]
-        )
+    rgb, alpha, depth = render_gaussian_params(
+        means=means,
+        quats=rotations,
+        scales=scales,
+        opacities=opacity,
+        features=features,
+        c2w=c2w,
+        K_matrix=Ks,
+        W=width,
+        H=height,
+        bg_color=bg_color,
+    )
     
-    # Convert to numpy and scale to uint8
-    #  = res["color"].permute(1, 2, 0)  # (3, H, W) -> (H, W, 3)
-    color = rgbd[0, ..., :3]  # (H, W, 3)
-    alpha = alpha[0]    # (H, W)
-    
-    return color, alpha
+    return rgb, alpha
 
 def load_image(path, to_uint8=True):
     image = Image.open(path)
@@ -1749,9 +1753,9 @@ def ensure_all_frames_have_tokens(
     return tokens_by_object
 
 
-def render_gaussian_differentiable(
+def render_gaussian_params(
     means, quats, scales, opacities, features,
-    K_matrix, W, H, bg_color=None
+    c2w, K_matrix, W, H, bg_color=None
 ):
     """
     Differentiable Gaussian rendering using gsplat.
@@ -1777,20 +1781,29 @@ def render_gaussian_differentiable(
         
     Returns
     -------
-    torch.Tensor
-        Rendered image (H, W, 3)
+    tuple
+        (rgb, alpha, depth) where rgb is the rendered image (H, W, 3)
     """
     device = means.device
     
-    # Identity camera (camera at origin looking along +Z)
-    w2c = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0)  # [1, 4, 4]
+    # View matrix: from camera to world
+    if isinstance(c2w, np.ndarray):
+        c2w_torch = torch.from_numpy(c2w).float().to(device)
+    else:
+        c2w_torch = c2w.float().to(device)
+    w2c = torch.inverse(c2w_torch)
+    
+    if w2c.dim() == 2:
+        w2c = w2c.unsqueeze(0)  # [1, 4, 4]
     
     # Intrinsics
     if isinstance(K_matrix, np.ndarray):
         K = torch.from_numpy(K_matrix).float().to(device)
     else:
         K = K_matrix.float().to(device)
-    K = K.unsqueeze(0)  # [1, 3, 3]
+    
+    if K.dim() == 2:
+        K = K.unsqueeze(0)  # [1, 3, 3]
     
     # Handle opacity shape
     if opacities.dim() == 2:
@@ -1803,24 +1816,24 @@ def render_gaussian_differentiable(
     
     # Default to white background
     if bg_color is None:
-        bg_color = torch.ones(3, device=device)
+        bg_color = torch.zeros(3, device=device)
     else:
         bg_color = bg_color.to(device)
     
     # Render using gsplat
     rgbd, alpha, info = rasterization(
-        means=means,
-        quats=quats,
-        scales=scales,
-        opacities=opacities,
-        colors=features,
-        viewmats=w2c,
-        Ks=K,
-        width=W,
+        means=means,  # (N, 3)
+        quats=quats,  # (N, 4)
+        scales=scales,  # (N, 3)
+        opacities=opacities,  # (N,)
+        colors=features,  # (N, 1, 3)
+        viewmats=w2c,  # (1, 4, 4)
+        Ks=K,  # (1, 3, 3)
+        width=W,  
         height=H,
         near_plane=0.1,
         far_plane=100000.0,
-        render_mode="RGB",
+        render_mode="RGB+ED",
         sh_degree=0,
         rasterize_mode="classic",
         distributed=False,
@@ -1829,7 +1842,11 @@ def render_gaussian_differentiable(
         backgrounds=bg_color[None, ...],
     )
     
-    return rgbd[0, ..., :3]  # (H, W, 3)
+    rgb = rgbd[0, ..., :3]  # (H, W, 3)
+    depth = rgbd[0, ..., 3]  # (H, W)
+    alpha = alpha[0, ..., 0]  # (H, W)
+    
+    return rgb, alpha, depth
 
 
 def apply_pose_to_gaussian(
@@ -1886,11 +1903,14 @@ def apply_pose_to_gaussian(
     rotation = rotation / rotation.norm()
     
     # Convert quaternion to rotation matrix
+    # PyTorch3D convention: quaternion_to_matrix gives R such that points are transformed as p @ R
     R = quaternion_to_matrix(rotation.unsqueeze(0)).squeeze(0)  # (3, 3)
     
-    # Transform positions: xyz_world = R @ (xyz_local * scale) + translation
+    # Transform positions following compose_transform convention:
+    # tfm = Scale(scale).compose(Rotate(R)).compose(Translate(trans))
+    # transformed = points * scale @ R + trans
     scaled_xyz = xyz_local * scale
-    transformed_xyz = torch.mm(scaled_xyz, R.T) + translation
+    transformed_xyz = torch.mm(scaled_xyz, R) + translation  # Note: @ R, not @ R.T
     
     # Transform rotations: rot_world = quaternion_multiply(rotation_inv, rot_local)
     # Note: Using inverse because of the convention in make_scene
@@ -1914,11 +1934,7 @@ def refine_pose_for_frame(
     gt_image,
     mask,
     K_matrix,
-    num_iterations=100,
-    lr_rotation=0.01,
-    lr_translation=0.001,
-    lr_scale=0.001,
-    verbose=True
+    config: RefinementConfig,
 ):
     """
     Refine pose parameters using differentiable Gaussian rendering.
@@ -1939,16 +1955,8 @@ def refine_pose_for_frame(
         Object mask (H, W), boolean
     K_matrix : np.ndarray
         Camera intrinsics (3, 3)
-    num_iterations : int
-        Number of optimization iterations
-    lr_rotation : float
-        Learning rate for rotation
-    lr_translation : float
-        Learning rate for translation
-    lr_scale : float
-        Learning rate for scale
-    verbose : bool
-        Print progress
+    config : RefinementConfig
+        Configuration for refinement hyperparameters.
         
     Returns
     -------
@@ -1992,95 +2000,184 @@ def refine_pose_for_frame(
     
     # Create optimizer with different learning rates
     optimizer = torch.optim.Adam([
-        {'params': [opt_rotation], 'lr': lr_rotation},
-        {'params': [opt_translation], 'lr': lr_translation},
-        {'params': [opt_scale_scalar], 'lr': lr_scale},
+        {'params': [opt_rotation], 'lr': config.lr_rotation},
+        {'params': [opt_translation], 'lr': config.lr_translation},
+        {'params': [opt_scale_scalar], 'lr': config.lr_scale},
     ])
     
     # Background color (white for evaluation)
-    bg_color = torch.ones(3, device=device)
+    bg_color = torch.zeros(3, device=device)
     
-    # Get Gaussian attributes (frozen)
-    with torch.no_grad():
-        xyz_local = canonical_gs.get_xyz.clone()
-        rot_local = canonical_gs.get_rotation.clone()
-        scales_local = canonical_gs.get_scaling.clone()
-        opacities = canonical_gs.get_opacity.clone()
-        features = canonical_gs.get_features.clone()
-        # Note: features shape is (N, 1, 3) or (N, K, 3) - render_gaussian_differentiable handles this
+    # # Get Gaussian attributes (frozen)
+    # with torch.no_grad():
+    #     xyz_local = canonical_gs.get_xyz.clone()
+    #     rot_local = canonical_gs.get_rotation.clone()
+    #     scales_local = canonical_gs.get_scaling.clone()
+    #     opacities = canonical_gs.get_opacity.clone()
+    #     features = canonical_gs.get_features.clone()
+    #     # Note: features shape is (N, 1, 3) or (N, K, 3) - render_gaussian_params handles this
     
     best_loss = float('inf')
     best_params = None
     best_iteration = 0
     loss_history = []
     
-    for iteration in range(num_iterations):
+    for iteration in range(config.num_iterations):
         optimizer.zero_grad()
         
-        # Normalize quaternion
-        rotation_normalized = opt_rotation / opt_rotation.norm()
-        
-        # Ensure proper shapes
-        rotation = rotation_normalized.view(-1)
-        if rotation.shape[0] != 4:
-            rotation = rotation[:4]
-        
-        translation = opt_translation.view(-1)
-        if translation.shape[0] != 3:
-            translation = translation[:3]
-        
-        # Uniform scale: expand scalar to 3D
-        scale = opt_scale_scalar.expand(3)
-        
-        # Convert quaternion to rotation matrix
-        R = quaternion_to_matrix(rotation.unsqueeze(0)).squeeze(0)  # (3, 3)
-        
-        # Transform positions
-        scaled_xyz = xyz_local * scale
-        transformed_xyz = torch.mm(scaled_xyz, R.T) + translation
-        
-        # Transform rotations
-        rotation_inv = quaternion_invert(rotation.unsqueeze(0)).squeeze(0)
-        transformed_rot = quaternion_multiply(
-            rotation_inv.unsqueeze(0).expand(rot_local.shape[0], -1),
-            rot_local
+        # TODO: need to detach?
+        transformed_xyz, transformed_rot, transformed_scales, opacities, features = apply_pose_to_gaussian(
+            canonical_gs=canonical_gs,
+            rotation=opt_rotation,
+            translation=opt_translation,
+            scale=opt_scale_scalar
         )
         
-        # Transform scales
-        transformed_scales = scales_local * scale
+        # Transform from PyTorch3D convention to R3 convention
+        # Camera convention transformation (R3 -> PyTorch3D)
+        r3_to_p3d_R, r3_to_p3d_T = look_at_view_transform(
+            eye=np.array([[0, 0, -1]]),
+            at=np.array([[0, 0, 0]]),
+            up=np.array([[0, -1, 0]]),
+            device=device,
+        )
+        
+        # Inverse transform (PyTorch3D -> R3)
+        p3d_to_r3_R = r3_to_p3d_R.transpose(1, 2)
+        
+        # Transform positions
+        camera_convention_transform = Transform3d(device=device).rotate(p3d_to_r3_R)
+        transformed_xyz = camera_convention_transform.transform_points(transformed_xyz)
+        
+        # Transform rotations (quaternions)
+        # Convert rotation matrix to quaternion (PyTorch3D uses wxyz format)
+        p3d_to_r3_quat = matrix_to_quaternion(p3d_to_r3_R)  # (1, 4) in wxyz format
+        
+        # Multiply quaternions: q_new = q_transform * q_original
+        transformed_rot = quaternion_multiply(
+            p3d_to_r3_quat.expand(transformed_rot.shape[0], -1),
+            transformed_rot
+        )
         
         # Handle opacities
         opacities_flat = opacities.squeeze(-1) if opacities.dim() == 2 else opacities
         
+        # C2W 
+        c2w = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0)  # [1, 4, 4]
+        
         # Render
-        rendered = render_gaussian_differentiable(
+        rgb, alpha, depth = render_gaussian_params(
             transformed_xyz,
             transformed_rot,
             transformed_scales,
             opacities_flat,
             features,
-            K_matrix, W, H,
+            c2w,
+            K_matrix,
+            W, H,
             bg_color=bg_color
         )
         
         # Compute loss in masked region only
+        
         # MSE loss
-        diff = (rendered - gt_image) ** 2
+        diff = (rgb - gt_image) ** 2
+        
+        # # DEBUG: Visualize rendered and gt_image and diff
+        # fig = plt.figure()
+        # plt.subplot(1, 3, 1)
+        # plt.title("Rendered")
+        # plt.imshow(rgb.detach().cpu().numpy())
+        # plt.axis('off')
+        # plt.subplot(1, 3, 2)
+        # plt.title("Ground Truth")
+        # plt.imshow(gt_image.detach().cpu().numpy())
+        # plt.axis('off')
+        # plt.subplot(1, 3, 3)
+        # plt.title("Diff")
+        # plt.imshow(diff.detach().cpu().numpy())
+        # plt.axis('off')
+        # plt.savefig("refine_pose_diff_debug.png")
+        # plt.close(fig)
+        
+        # # DEBUG: Visualize rendered alpha and mask and their difference
+        # fig = plt.figure()
+        # plt.subplot(1, 3, 1)
+        # plt.title("Rendered Alpha")
+        # plt.imshow(alpha.detach().cpu().numpy(), cmap='gray')
+        # plt.axis('off')
+        # plt.subplot(1, 3, 2)
+        # plt.title("Mask")
+        # plt.imshow(mask.detach().cpu().numpy(), cmap='gray')
+        # plt.axis('off')
+        # plt.subplot(1, 3, 3)
+        # plt.title("Alpha - Mask")
+        # plt.imshow((alpha - mask.float()).detach().cpu().numpy(), cmap='gray')
+        # plt.axis('off')
+        # plt.savefig("refine_pose_alpha_mask_debug.png")
+        # plt.close(fig)
+        
+        # exit(0)
+        
         masked_diff = diff[mask]
-        loss = masked_diff.mean()
+        rgb_loss = masked_diff.mean()
+        
+        # Silhouette loss: encourage rendered alpha to match the object mask
+        # alpha is (1, H, W), mask is (H, W) boolean
+        alpha_squeezed = alpha.squeeze(0)  # (H, W)
+        mask_float = mask.float()  # Convert boolean mask to float (0 or 1)
+        
+        # Binary cross-entropy between rendered alpha and GT mask
+        # Clamp alpha to avoid log(0)
+        alpha_clamped = torch.clamp(alpha_squeezed, 1e-6, 1.0 - 1e-6)
+        silhouette_loss = -(mask_float * torch.log(alpha_clamped) + 
+                           (1 - mask_float) * torch.log(1 - alpha_clamped)).mean()
+        
+        # Weight for silhouette loss
+        weighted_silhouette_loss = config.silhouette_weight * silhouette_loss
+        
+        # Debug: Check if rendered object overlaps with mask
+        if iteration == 0 and config.verbose:
+            # Check how much the rendered differs from background in masked region
+            with torch.no_grad():
+                rendered_in_mask = rgb[mask]
+                bg_in_mask = bg_color.expand(rendered_in_mask.shape[0], -1)
+                non_bg_mask = (rendered_in_mask - bg_in_mask).abs().sum(dim=-1) > 0.01
+                print(f"      [Overlap check] Mask pixels: {mask.sum().item()}, Non-background in mask: {non_bg_mask.sum().item()} ({100*non_bg_mask.float().mean().item():.1f}%)")
         
         # Optional: add regularization to prevent large deviations from initial pose
-        reg_weight = 0.001
-        reg_rot = ((rotation_normalized - initial_rotation / initial_rotation.norm()) ** 2).sum()
+        opt_rotation_normalized = opt_rotation / opt_rotation.norm()
+        reg_rot = ((opt_rotation_normalized - initial_rotation / initial_rotation.norm()) ** 2).sum()
         reg_trans = ((opt_translation - initial_translation) ** 2).sum()
         reg_scale = ((opt_scale_scalar - initial_scale_scalar) ** 2).sum()
-        loss = loss + reg_weight * (reg_rot + reg_trans + reg_scale)
+        weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans + reg_scale)
         
-        # Record loss for this iteration
-        loss_history.append(loss.item())
+        # Total loss
+        loss = rgb_loss + weighted_silhouette_loss + weighted_reg_loss
+        
+        # Record loss for this iteration (both total and individual terms)
+        loss_history.append({
+            'total': loss.item(),
+            'rgb': rgb_loss.item(),
+            'silhouette': weighted_silhouette_loss.item(),
+            'regularization': weighted_reg_loss.item(),
+        })
         
         # Backprop
         loss.backward()
+        
+        # Debug: Check gradients on first iteration
+        if iteration == 0 and config.verbose:
+            rot_grad = opt_rotation.grad
+            trans_grad = opt_translation.grad
+            scale_grad = opt_scale_scalar.grad
+            print(f"      [Gradient check] rotation grad: {rot_grad.abs().max().item() if rot_grad is not None else 'None':.6e}")
+            print(f"      [Gradient check] translation grad: {trans_grad.abs().max().item() if trans_grad is not None else 'None':.6e}")
+            print(f"      [Gradient check] scale grad: {scale_grad.abs().max().item() if scale_grad is not None else 'None':.6e}")
+            print(f"      [Gradient check] transformed_xyz requires_grad: {transformed_xyz.requires_grad}")
+            print(f"      [Gradient check] rgb requires_grad: {rgb.requires_grad}")
+            print(f"      [Gradient check] loss requires_grad: {loss.requires_grad}")
+        
         optimizer.step()
         
         # Track best
@@ -2095,10 +2192,11 @@ def refine_pose_for_frame(
                 'scale': scale_3d,
             }
         
-        if verbose and (iteration % 20 == 0 or iteration == num_iterations - 1):
-            print(f"      Iteration {iteration}: loss = {loss.item():.6f}")
+        if config.verbose and (iteration % config.log_interval == 0 or iteration == config.num_iterations - 1):
+            print(f"      Iteration {iteration}: total={loss.item():.6f} rgb={rgb_loss.item():.6f} "
+                  f"silh={weighted_silhouette_loss.item():.6f} reg={weighted_reg_loss.item():.8f}")
     
-    if verbose:
+    if config.verbose:
         print(f"      Best loss: {best_loss:.6f} (iteration {best_iteration})")
     
     # Normalize the rotation in best_params
@@ -2110,15 +2208,11 @@ def refine_pose_for_frame(
     
     return best_params
 
-
 def refine_poses_for_sequence(
     canonical_gaussians,
     tokens_by_object,
     args, paths, inference,
-    num_iterations=100,
-    lr_rotation=0.01,
-    lr_translation=0.001,
-    lr_scale=0.001,
+    config: RefinementConfig,
 ):
     """
     Refine per-frame poses for all objects using differentiable rendering.
@@ -2135,8 +2229,8 @@ def refine_poses_for_sequence(
         Dataset paths
     inference : Inference
         Inference pipeline (for depth estimation if needed)
-    num_iterations : int
-        Number of optimization iterations per frame
+    config : RefinementConfig
+        Configuration for refinement hyperparameters. If None, uses defaults.
         
     Returns
     -------
@@ -2206,11 +2300,7 @@ def refine_poses_for_sequence(
                 gt_image,
                 mask,
                 K_matrix,
-                num_iterations=num_iterations,
-                lr_rotation=lr_rotation,
-                lr_translation=lr_translation,
-                lr_scale=lr_scale,
-                verbose=True
+                config=config,
             )
             
             # Create refined decoder input (including loss history for plotting)

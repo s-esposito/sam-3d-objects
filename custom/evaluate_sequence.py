@@ -63,6 +63,9 @@ import sys
 import json
 import argparse
 import torch
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for saving figures
 
 # Skip sam3d_objects initialization for lightweight usage
 os.environ['LIDRA_SKIP_INIT'] = '1'
@@ -91,6 +94,7 @@ from utils import (
     process_frame_from_cache,
     process_frame_full_inference,
     refine_poses_for_sequence,
+    RefinementConfig,
 )
 from evaluator import Evaluator
 from inference import Inference, make_scene
@@ -341,11 +345,6 @@ def evaluate_with_canonical_objects(
             traceback.print_exc()
             continue
     
-    # Evaluate
-    if len(rendered_frames) == 0:
-        print("  No frames were successfully processed!")
-        return None
-    
     seq_metrics = evaluator.evaluate_sequence(gt_frames, rendered_frames)
     
     # Build summary
@@ -409,6 +408,91 @@ def print_evaluation_summary(summary, title="Evaluation Summary"):
     print("\nLPIPS (lower is better):")
     print(f"  Mean: {summary['lpip_mean']:.4f} ± {summary['lpip_std']:.4f}")
     print(f"  Range: [{summary['lpip_min']:.4f}, {summary['lpip_max']:.4f}]")
+
+
+def plot_refinement_history(refinement_data, output_path):
+    """
+    Plot refinement loss history for all frames and objects in a grid.
+    
+    Creates a figure where:
+    - Rows: frames (sorted by frame index)
+    - Columns: loss types (total, rgb, silhouette, regularization)
+    
+    Parameters
+    ----------
+    refinement_data : dict
+        Refinement history data loaded from JSON
+    output_path : str
+        Path to save the output figure
+    """
+    # Collect all frames across all objects
+    all_frames = []
+    for obj_idx, obj_data in refinement_data['objects'].items():
+        for frame_idx, frame_data in obj_data.items():
+            all_frames.append({
+                'obj_idx': int(obj_idx),
+                'frame_idx': int(frame_idx),
+                'loss_history': frame_data['loss_history'],
+                'best_iteration': frame_data['best_iteration'],
+            })
+    
+    if not all_frames:
+        print("No refinement data to plot")
+        return
+    
+    # Sort by object index, then frame index
+    all_frames.sort(key=lambda x: (x['obj_idx'], x['frame_idx']))
+    
+    # Loss types to plot
+    loss_types = ['total', 'rgb', 'silhouette', 'regularization']
+    loss_titles = ['Total Loss', 'RGB Loss', 'Silhouette Loss', 'Regularization']
+    
+    n_frames = len(all_frames)
+    n_cols = len(loss_types)
+    
+    # Create figure with subplots
+    fig_height = max(3, 1.5 * n_frames)
+    fig, axes = plt.subplots(n_frames, n_cols, figsize=(4 * n_cols, fig_height), squeeze=False)
+    
+    for row_idx, frame_info in enumerate(all_frames):
+        loss_history = frame_info['loss_history']
+        best_iter = frame_info['best_iteration']
+        iterations = list(range(len(loss_history)))
+        
+        for col_idx, (loss_type, title) in enumerate(zip(loss_types, loss_titles)):
+            ax = axes[row_idx, col_idx]
+            
+            # Extract loss values for this type
+            values = [h[loss_type] for h in loss_history]
+            
+            # Plot the loss curve
+            ax.plot(iterations, values, 'b-', linewidth=1)
+            
+            # Mark best iteration
+            if best_iter < len(values):
+                ax.axvline(x=best_iter, color='r', linestyle='--', alpha=0.7, linewidth=0.8)
+                ax.scatter([best_iter], [values[best_iter]], color='r', s=20, zorder=5)
+            
+            # Labels
+            if row_idx == 0:
+                ax.set_title(title, fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(f"Obj {frame_info['obj_idx']}, F{frame_info['frame_idx']}", fontsize=8)
+            if row_idx == n_frames - 1:
+                ax.set_xlabel('Iteration', fontsize=8)
+            
+            # Formatting
+            ax.tick_params(axis='both', labelsize=7)
+            ax.grid(True, alpha=0.3)
+            
+            # Scientific notation for small values (regularization)
+            if loss_type == 'regularization':
+                ax.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved refinement loss plot to {output_path}")
 
 
 def parse_args():
@@ -733,14 +817,19 @@ def main():
             print("REFINING POSES")
             print("=" * 60)
             
-            tokens_by_object = refine_poses_for_sequence(
-                canonical_gaussians,
-                tokens_by_object,
-                args, paths, inference,
+            # Create refinement config from command line arguments
+            refinement_config = RefinementConfig(
                 num_iterations=args.refine_iterations,
                 lr_rotation=args.refine_lr_rotation,
                 lr_translation=args.refine_lr_translation,
                 lr_scale=args.refine_lr_scale,
+            )
+            
+            tokens_by_object = refine_poses_for_sequence(
+                canonical_gaussians,
+                tokens_by_object,
+                args, paths, inference,
+                config=refinement_config,
             )
             
             # Evaluate AFTER refinement
@@ -813,6 +902,13 @@ def main():
                 with open(refinement_path, 'w') as f:
                     json.dump(refinement_data, f, indent=2)
                 print(f"\nSaved refinement loss history to {refinement_path}")
+                
+                # Plot refinement loss curves
+                plot_path = os.path.join(
+                    args.output_dir,
+                    f"{args.scene_name}_averaged_{args.weighting_type}_refinement_history.png"
+                )
+                plot_refinement_history(refinement_data, plot_path)
         
         else:
             # No refinement requested - just evaluate once
