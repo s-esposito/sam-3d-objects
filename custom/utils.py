@@ -1,6 +1,7 @@
 import os
 import sys
 import math
+import json
 import numpy as np
 import time
 import glob
@@ -13,6 +14,7 @@ from pytorch3d.transforms import Transform3d
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply
 from pytorch3d.renderer import look_at_view_transform
 from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert
+from inference import make_scene
 
 
 @dataclass
@@ -46,11 +48,11 @@ from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.gaussian_mod
 from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
 
 
-def get_cache_filename(scene_name, frame_index, first_object_only=False, with_background=False):
+def get_cache_filename(scene_name, frame_index, object_index=None, with_background=False):
     """Build the cache filename based on configuration."""
     cache_parts = [scene_name, f"f{frame_index}"]
-    if first_object_only:
-        cache_parts.append("first")
+    if object_index is not None:
+        cache_parts.append(f"obj{object_index}")
     if with_background:
         cache_parts.append("bg")
     cache_scene_name = "_".join(cache_parts)
@@ -266,41 +268,53 @@ def run_inference_on_masks(inference, image, masks, pointmap, seed=42):
     return outputs
 
 
-def save_tokens(tokens_path, scene_name, outputs):
+def save_tokens(tokens_path, scene_name, outputs, frame_index, object_indices):
     """
     Save inference results to cache.
     
     Stores the essential data needed to reconstruct the Gaussian scene:
-    - gaussian: The Gaussian object for each mask
     - rotation: Object rotation quaternion
     - translation: Object translation vector
     - scale: Object scale factor
-    - decoder_input_coords: Sparse 3D coordinates for decoder (optional)
-    - decoder_input_slat: SLAT latent features for decoder (optional)
+    - decoder_input_coords: Sparse 3D coordinates for decoder
+    - decoder_input_slat: SLAT latent features for decoder
+    - frame_index: Index of the frame this data comes from
+    - object_index: Index of the object in the original mask list
+    
+    Note: Gaussians are NOT saved as they can be recomputed from the decoder inputs.
+    
+    Parameters
+    ----------
+    tokens_path : str
+        Directory to save the cache file
+    scene_name : str
+        Name for the cache file (without extension)
+    outputs : list
+        List of output dictionaries from inference
+    frame_index : int
+        Frame index this data comes from
+    object_indices : list of int
+        List of object indices corresponding to each output. Must have the same
+        length as outputs. Each index represents the object's position in the
+        original mask list.
     """
+    if len(outputs) != len(object_indices):
+        raise ValueError(f"outputs and object_indices must have same length, "
+                         f"got {len(outputs)} and {len(object_indices)}")
+    
     cache_file = os.path.join(tokens_path, f"{scene_name}_sam3d_results.npz")
     
     # Extract and serialize the necessary data for each output
     cached_data = []
-    for output in outputs:
-        # Extract Gaussian model state
-        gs = output["gaussian"][0]
-        gs_data = {
-            'xyz': gs.get_xyz.cpu().numpy(),
-            'features_dc': gs.get_features.cpu().numpy(),
-            'scaling': gs.get_scaling.cpu().numpy(),
-            'rotation': gs.get_rotation.cpu().numpy(),
-            'opacity': gs.get_opacity.cpu().numpy(),
-            'aabb': gs.aabb.cpu().numpy() if hasattr(gs, 'aabb') and gs.aabb is not None else None,
-            'mininum_kernel_size': gs.mininum_kernel_size if hasattr(gs, 'mininum_kernel_size') else None,
-        }
-        
-        # Extract pose data
+    for i, output in enumerate(outputs):
+        # Extract pose data (gaussians can be recomputed from decoder inputs)
         output_data = {
-            'gaussian_data': gs_data,
             'rotation': output["rotation"].cpu().numpy(),
             'translation': output["translation"].cpu().numpy(),
             'scale': output["scale"].cpu().numpy(),
+            # Store frame and object indices for tracking
+            'frame_index': frame_index,
+            'object_index': object_indices[i],
         }
         
         # Save decoder inputs if available (for re-running decoder)
@@ -318,6 +332,7 @@ def save_tokens(tokens_path, scene_name, outputs):
         cache_file,
         cached_data=np.array(cached_data, dtype=object),
         num_objects=len(outputs),
+        frame_index=frame_index,  # Also save at top level for quick access
     )
     print(f"Cached results saved to {cache_file}")
 
@@ -1193,7 +1208,7 @@ def compute_frame_weights_from_masks(tokens_list, dataset_path, scene_name, data
     weights = []
     
     for frame_idx, decoder_input in tokens_list:
-        try:
+        
             if dataset_type == "kubric4d":
                 frames_path = os.path.join(dataset_path, scene_name, "frames_p0_v0")
                 mask_files = sorted([f for f in os.listdir(frames_path) if f.startswith("segmentation_") and f.endswith(".png")])
@@ -1228,11 +1243,8 @@ def compute_frame_weights_from_masks(tokens_list, dataset_path, scene_name, data
                 else:
                     weights.append(1.0)
             else:
-                weights.append(1.0)
                 
-        except Exception as e:
-            print(f"    Warning: Could not load mask for frame {frame_idx}, object {obj_idx}: {e}")
-            weights.append(1.0)
+                raise ValueError(f"Unsupported dataset type for mask-based weights: {dataset_type}")
     
     weights = torch.tensor(weights, dtype=torch.float32)
     
@@ -1279,81 +1291,77 @@ def compute_frame_weights_from_error(tokens_by_object, obj_idx, args, paths, inf
     print(f"    Computing error-based weights for object {obj_idx}...")
     
     for frame_idx, decoder_input in tokens_list:
-        try:
-            # Load frame's image and mask
-            image_path = os.path.join(paths['frames_path'], paths['image_names'][frame_idx])
-            mask_path = os.path.join(paths['masks_path'], paths['mask_names'][frame_idx])
-            
-            image = load_image(image_path)
-            image = image[..., :3]
-            H, W, _ = image.shape
-            
-            masks = load_masks(mask_path)
-            if obj_idx < len(masks):
-                mask = masks[obj_idx]
-            else:
-                print(f"      Frame {frame_idx}: Object {obj_idx} not in masks, using uniform weight")
-                errors.append(1.0)
-                continue
-            
-            # Load depth for K_matrix
-            depth_names_for_frame = []
-            if paths['dataset_type'] == 'kubric4d' and paths['depth_names']:
-                depth_names_for_frame = [paths['depth_names'][frame_idx]]
-            
-            pointmap, K_matrix, valid_mask = load_and_process_depth(
-                paths['frames_path'],
-                depth_names_for_frame,
-                W, H,
-                use_moge=args.use_moge,
-                inference=inference,
-                image=image
-            )
-            
-            # Decode this frame's tokens to get Gaussian
-            slat = decoder_input['decoder_input_slat']
-            decoded = redecode_slat(pipeline, slat, formats=["gaussian"])
-            
-            # Build output and render
-            output = {
-                'gaussian': decoded['gaussian'],
-                'rotation': decoder_input['rotation'],
-                'translation': decoder_input['translation'],
-                'scale': decoder_input['scale'],
-            }
-            
-            scene_gs = make_scene(output)
-            new_scene_gs = transform_scene_to_r3_convention(scene_gs)
-            
-            # Render
-            rendered = render_gaussians_to_image(new_scene_gs, K_matrix, W, H)
-            rendered = torch.clamp(rendered.cpu(), 0.0, 1.0)
-            
-            # Ground truth
-            gt_image = torch.from_numpy(image).float() / 255.0
-            
-            # Compute masked MSE
-            mask_tensor = torch.from_numpy(mask).float()
-            if mask_tensor.dim() == 2:
-                mask_tensor = mask_tensor.unsqueeze(-1)  # (H, W, 1)
-            
-            # Compute error only in masked region
-            diff = (rendered - gt_image) ** 2
-            masked_diff = diff * mask_tensor
-            
-            # Mean error in masked region
-            num_masked_pixels = mask_tensor.sum()
-            if num_masked_pixels > 0:
-                masked_mse = masked_diff.sum() / (num_masked_pixels * 3)  # 3 for RGB channels
-                errors.append(masked_mse.item())
-            else:
-                errors.append(1.0)  # Default error if no masked pixels
-            
-            print(f"      Frame {frame_idx}: masked MSE = {errors[-1]:.6f}")
-            
-        except Exception as e:
-            print(f"      Frame {frame_idx}: Error computing - {e}")
+        
+        # Load frame's image and mask
+        image_path = os.path.join(paths['frames_path'], paths['image_names'][frame_idx])
+        mask_path = os.path.join(paths['masks_path'], paths['mask_names'][frame_idx])
+        
+        image = load_image(image_path)
+        image = image[..., :3]
+        H, W, _ = image.shape
+        
+        masks = load_masks(mask_path)
+        if obj_idx < len(masks):
+            mask = masks[obj_idx]
+        else:
+            print(f"      Frame {frame_idx}: Object {obj_idx} not in masks, using uniform weight")
             errors.append(1.0)
+            continue
+        
+        # Load depth for K_matrix
+        depth_names_for_frame = []
+        if paths['dataset_type'] == 'kubric4d' and paths['depth_names']:
+            depth_names_for_frame = [paths['depth_names'][frame_idx]]
+        
+        pointmap, K_matrix, valid_mask = load_and_process_depth(
+            paths['frames_path'],
+            depth_names_for_frame,
+            W, H,
+            use_moge=args.use_moge,
+            inference=inference,
+            image=image
+        )
+        
+        # Decode this frame's tokens to get Gaussian
+        slat = decoder_input['decoder_input_slat']
+        decoded = redecode_slat(pipeline, slat, formats=["gaussian"])
+        
+        # Build output and render
+        output = {
+            'gaussian': decoded['gaussian'],
+            'rotation': decoder_input['rotation'],
+            'translation': decoder_input['translation'],
+            'scale': decoder_input['scale'],
+        }
+        
+        scene_gs = make_scene(output)
+        new_scene_gs = transform_scene_to_r3_convention(scene_gs)
+        
+        # Render
+        rendered = render_gaussians_to_image(new_scene_gs, K_matrix, W, H)
+        rendered = torch.clamp(rendered.cpu(), 0.0, 1.0)
+        
+        # Ground truth
+        gt_image = torch.from_numpy(image).float() / 255.0
+        
+        # Compute masked MSE
+        mask_tensor = torch.from_numpy(mask).float()
+        if mask_tensor.dim() == 2:
+            mask_tensor = mask_tensor.unsqueeze(-1)  # (H, W, 1)
+        
+        # Compute error only in masked region
+        diff = (rendered - gt_image) ** 2
+        masked_diff = diff * mask_tensor
+        
+        # Mean error in masked region
+        num_masked_pixels = mask_tensor.sum()
+        if num_masked_pixels > 0:
+            masked_mse = masked_diff.sum() / (num_masked_pixels * 3)  # 3 for RGB channels
+            errors.append(masked_mse.item())
+        else:
+            errors.append(1.0)  # Default error if no masked pixels
+        
+        print(f"      Frame {frame_idx}: masked MSE = {errors[-1]:.6f}")
     
     # Convert errors to weights: lower error = higher weight
     # Use inverse error with softmax-like normalization
@@ -1477,6 +1485,8 @@ def load_decoder_inputs_from_cache(cache_file):
     -------
     list of dict
         List of decoder inputs, one per object. Each dict contains:
+        - object_index: Index of the object in the original mask list
+        - frame_index: Index of the frame this data comes from (or None if not saved)
         - decoder_input_slat: SparseTensor with SLAT latent features
         - rotation, translation, scale: Layout parameters (pose)
         
@@ -1495,23 +1505,8 @@ def load_decoder_inputs_from_cache(cache_file):
     
     decoder_inputs = []
     for i, data in enumerate(cached_data):
+        
         data = data.item() if hasattr(data, 'item') else data
-        
-        # Check if decoder inputs are available
-        if 'decoder_input_slat_feats' not in data or 'decoder_input_slat_coords' not in data:
-            raise ValueError(
-                f"Object {i} in {cache_file} does not have decoder inputs saved. "
-                f"Re-run demo.py to regenerate the cache with decoder inputs."
-            )
-        
-        # Check if poses are available
-        required_pose_keys = ['rotation', 'translation', 'scale']
-        missing_keys = [k for k in required_pose_keys if k not in data]
-        if missing_keys:
-            raise ValueError(
-                f"Object {i} in {cache_file} is missing pose parameters: {missing_keys}. "
-                f"Re-run demo.py to regenerate the cache with pose data."
-            )
         
         slat_feats = torch.from_numpy(data['decoder_input_slat_feats']).cuda()
         slat_coords = torch.from_numpy(data['decoder_input_slat_coords']).cuda()
@@ -1522,7 +1517,13 @@ def load_decoder_inputs_from_cache(cache_file):
             feats=slat_feats,
         ).cuda()
         
+        # Load object_index and frame_index from data if available
+        object_index = data['object_index'] 
+        frame_index = data['frame_index']
+        
         decoder_input = {
+            'object_index': object_index,
+            'frame_index': frame_index,
             'decoder_input_slat': slat,
             'rotation': torch.from_numpy(data['rotation']).cuda(),
             'translation': torch.from_numpy(data['translation']).cuda(),
@@ -1534,7 +1535,7 @@ def load_decoder_inputs_from_cache(cache_file):
     return decoder_inputs
 
 
-def load_all_frame_tokens(tokens_dir, scene_name, first_object_only=False, with_background=False):
+def load_all_frame_tokens(tokens_dir, scene_name, object_index=None, with_background=False):
     """
     Load SLAT tokens from all available frames for a scene.
     
@@ -1545,8 +1546,8 @@ def load_all_frame_tokens(tokens_dir, scene_name, first_object_only=False, with_
     """
     # Find all cache files for this scene
     cache_pattern = f"{scene_name}_f*"
-    if first_object_only:
-        cache_pattern += "_first"
+    if object_index is not None:
+        cache_pattern += f"_obj{object_index}"
     if with_background:
         cache_pattern += "_bg"
     cache_pattern += "_sam3d_results.npz"
@@ -1568,21 +1569,13 @@ def load_all_frame_tokens(tokens_dir, scene_name, first_object_only=False, with_
         # Extract frame index from filename
         basename = os.path.basename(cache_file)
         # Pattern: {scene_name}_f{frame_idx}_...
-        try:
-            parts = basename.split('_')
-            frame_part = [p for p in parts if p.startswith('f') and p[1:].isdigit()][0]
-            frame_idx = int(frame_part[1:])
-        except (IndexError, ValueError):
-            print(f"Warning: Could not parse frame index from {basename}, skipping")
-            continue
+        parts = basename.split('_')
+        frame_part = [p for p in parts if p.startswith('f') and p[1:].isdigit()][0]
+        frame_idx = int(frame_part[1:])
         
         print(f"  Loading frame {frame_idx} from {basename}")
         
-        try:
-            decoder_inputs = load_decoder_inputs_from_cache(cache_file)
-        except Exception as e:
-            print(f"    Error loading: {e}")
-            continue
+        decoder_inputs = load_decoder_inputs_from_cache(cache_file)
         
         for obj_idx, decoder_input in enumerate(decoder_inputs):
             if obj_idx not in tokens_by_object:
@@ -1632,8 +1625,8 @@ def compute_and_cache_frame_tokens(
     H, W, _ = image.shape
     
     masks = load_masks(mask_path)
-    if args.first_object_only:
-        masks = masks[:1]
+    if args.object_index is not None:
+        masks = [masks[args.object_index]]
     
     print(f"    Loaded image {image.shape}, {len(masks)} masks")
     
@@ -1659,15 +1652,21 @@ def compute_and_cache_frame_tokens(
     
     # Build cache filename (matching demo.py format)
     cache_parts = [args.scene_name, f"f{frame_index}"]
-    if args.first_object_only:
-        cache_parts.append("first")
-    if args.with_background:
+    if args.object_index is not None:
+        cache_parts.append(f"obj{args.object_index}")
+    if not args.no_background:
         cache_parts.append("bg")
     cache_scene_name = "_".join(cache_parts)
     
-    # Cache results
+    # Cache results with frame and object index information
     os.makedirs(tokens_dir, exist_ok=True)
-    save_tokens(tokens_dir, cache_scene_name, outputs)
+    if args.object_index is not None:
+        # Processing single object
+        object_indices = [args.object_index]
+    else:
+        # Processing all objects
+        object_indices = list(range(len(outputs)))
+    save_tokens(tokens_dir, cache_scene_name, outputs, frame_index, object_indices)
     
     cache_file = os.path.join(tokens_dir, f"{cache_scene_name}_sam3d_results.npz")
     return cache_file
@@ -1702,7 +1701,7 @@ def ensure_all_frames_have_tokens(
     # First, load existing tokens
     tokens_by_object = load_all_frame_tokens(
         tokens_dir, args.scene_name,
-        args.first_object_only, args.with_background
+        args.object_index, not args.no_background
     )
     
     # Find which frames already have tokens
@@ -1724,25 +1723,18 @@ def ensure_all_frames_have_tokens(
     for i, frame_index in enumerate(missing_frames):
         print(f"\n  Frame {frame_index} ({i + 1}/{len(missing_frames)})")
         
-        try:
-            cache_file = compute_and_cache_frame_tokens(
-                args, paths, frame_index, inference, tokens_dir
-            )
-            
-            # Load the newly cached tokens and add to tokens_by_object
-            decoder_inputs = load_decoder_inputs_from_cache(cache_file)
-            for obj_idx, decoder_input in enumerate(decoder_inputs):
-                if obj_idx not in tokens_by_object:
-                    tokens_by_object[obj_idx] = []
-                tokens_by_object[obj_idx].append((frame_index, decoder_input))
-            
-            print(f"    Cached to {os.path.basename(cache_file)}")
-            
-        except Exception as e:
-            print(f"    Error computing frame {frame_index}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+        cache_file = compute_and_cache_frame_tokens(
+            args, paths, frame_index, inference, tokens_dir
+        )
+        
+        # Load the newly cached tokens and add to tokens_by_object
+        decoder_inputs = load_decoder_inputs_from_cache(cache_file)
+        for obj_idx, decoder_input in enumerate(decoder_inputs):
+            if obj_idx not in tokens_by_object:
+                tokens_by_object[obj_idx] = []
+            tokens_by_object[obj_idx].append((frame_index, decoder_input))
+        
+        print(f"    Cached to {os.path.basename(cache_file)}")
     
     # Re-sort by frame index
     for obj_idx in tokens_by_object:
@@ -2018,7 +2010,7 @@ def refine_pose_for_frame(
     #     # Note: features shape is (N, 1, 3) or (N, K, 3) - render_gaussian_params handles this
     
     best_loss = float('inf')
-    best_params = None
+    best_params = {}
     best_iteration = 0
     loss_history = []
     
@@ -2208,11 +2200,46 @@ def refine_pose_for_frame(
     
     return best_params
 
+
+def decode_per_frame_gaussians(tokens_by_object, pipeline):
+    """
+    Decode Gaussians for each (frame, object) pair from cached tokens.
+    
+    In standard mode (without token averaging), each frame has its own Gaussian
+    in local space. This function decodes all tokens and returns per-frame
+    canonical Gaussians.
+    
+    Parameters
+    ----------
+    tokens_by_object : dict
+        Dictionary mapping object_index -> list of (frame_index, decoder_input)
+    pipeline : Pipeline
+        The inference pipeline for decoding
+        
+    Returns
+    -------
+    dict
+        Dictionary mapping object_index -> dict[frame_index -> canonical Gaussian]
+    """
+    canonical_gaussians_per_frame = {}
+    
+    for obj_idx in sorted(tokens_by_object.keys()):
+        canonical_gaussians_per_frame[obj_idx] = {}
+        
+        for frame_idx, decoder_input in tokens_by_object[obj_idx]:
+            slat = decoder_input['decoder_input_slat']
+            decoded = redecode_slat(pipeline, slat, formats=["gaussian"])
+            canonical_gaussians_per_frame[obj_idx][frame_idx] = decoded['gaussian'][0]
+    
+    return canonical_gaussians_per_frame
+
+
 def refine_poses_for_sequence(
     canonical_gaussians,
     tokens_by_object,
     args, paths, inference,
     config: RefinementConfig,
+    per_frame_canonical=False,
 ):
     """
     Refine per-frame poses for all objects using differentiable rendering.
@@ -2220,7 +2247,9 @@ def refine_poses_for_sequence(
     Parameters
     ----------
     canonical_gaussians : dict
-        Dictionary mapping object_index -> canonical Gaussian
+        Dictionary mapping object_index -> canonical Gaussian (if per_frame_canonical=False)
+        OR Dictionary mapping object_index -> dict[frame_index -> canonical Gaussian] 
+        (if per_frame_canonical=True)
     tokens_by_object : dict
         Dictionary mapping object_index -> list of (frame_index, decoder_input)
     args : argparse.Namespace
@@ -2230,7 +2259,10 @@ def refine_poses_for_sequence(
     inference : Inference
         Inference pipeline (for depth estimation if needed)
     config : RefinementConfig
-        Configuration for refinement hyperparameters. If None, uses defaults.
+        Configuration for refinement hyperparameters.
+    per_frame_canonical : bool
+        If True, use per-frame canonical Gaussians (standard mode).
+        If False, use shared canonical Gaussians across frames (averaged-tokens mode).
         
     Returns
     -------
@@ -2241,13 +2273,26 @@ def refine_poses_for_sequence(
     
     refined_tokens = {}
     
-    for obj_idx in sorted(canonical_gaussians.keys()):
+    for obj_idx in sorted(tokens_by_object.keys()):
         print(f"\n    Object {obj_idx}:")
         refined_tokens[obj_idx] = []
-        canonical_gs = canonical_gaussians[obj_idx]
         
         for frame_idx, decoder_input in tokens_by_object[obj_idx]:
             print(f"      Frame {frame_idx}:")
+            
+            # Get the canonical Gaussian for this object (and frame, if per_frame_canonical)
+            if per_frame_canonical:
+                if obj_idx not in canonical_gaussians or frame_idx not in canonical_gaussians[obj_idx]:
+                    print(f"        Warning: No canonical Gaussian for object {obj_idx} frame {frame_idx}, skipping")
+                    refined_tokens[obj_idx].append((frame_idx, decoder_input))
+                    continue
+                canonical_gs = canonical_gaussians[obj_idx][frame_idx]
+            else:
+                if obj_idx not in canonical_gaussians:
+                    print(f"        Warning: No canonical Gaussian for object {obj_idx}, skipping")
+                    refined_tokens[obj_idx].append((frame_idx, decoder_input))
+                    continue
+                canonical_gs = canonical_gaussians[obj_idx]
             
             # Load frame data
             image_path = os.path.join(paths['frames_path'], paths['image_names'][frame_idx])
@@ -2258,8 +2303,8 @@ def refine_poses_for_sequence(
             H, W, _ = image.shape
             
             masks = load_masks(mask_path)
-            if args.first_object_only:
-                masks = masks[:1]
+            if args.object_index is not None:
+                masks = [masks[args.object_index]]
             
             # Get the mask for this object
             if obj_idx < len(masks):
@@ -2325,11 +2370,12 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     Returns
     -------
     tuple
-        (rendered_image, gt_image, K_matrix) or None if cache not found
+        (rendered_image, gt_image, K_matrix, masks) or None if cache not found
+        masks is a list of numpy arrays (H, W) boolean masks per object
     """
     # Build cache filename
     cache_filename, cache_scene_name = get_cache_filename(
-        args.scene_name, frame_index, args.first_object_only, args.with_background
+        args.scene_name, frame_index, args.object_index, not args.no_background
     )
     cache_file = os.path.join(tokens_dir, cache_filename)
     
@@ -2348,8 +2394,8 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     H, W, _ = image.shape
     
     masks = load_masks(mask_path)
-    if args.first_object_only:
-        masks = masks[:1]
+    if args.object_index is not None:
+        masks = [masks[args.object_index]]
     
     # Load depth and compute K_matrix (needed for rendering)
     depth_names_for_frame = []
@@ -2366,7 +2412,7 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     )
     
     # Keep original pointmap for background
-    pointmap_original = pointmap.copy() if args.with_background else None
+    pointmap_original = pointmap.copy() if not args.no_background else None
     
     # Load decoder inputs from cache
     decoder_inputs = load_decoder_inputs_from_cache(cache_file)
@@ -2401,7 +2447,7 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     new_scene_gs = transform_scene_to_r3_convention(scene_gs)
     
     # Add background Gaussians if requested
-    if args.with_background and pointmap_original is not None:
+    if not args.no_background and pointmap_original is not None:
         background_gs = create_background_gaussians(
             image, pointmap_original, masks, K_matrix
         )
@@ -2416,12 +2462,18 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     # Clamp rendered to [0, 1]
     rendered = torch.clamp(rendered.cpu(), 0.0, 1.0)
     
-    return rendered, gt_image, K_matrix
+    return rendered, gt_image, K_matrix, masks
 
 
 def process_frame_full_inference(args, paths, frame_index, inference):
     """
     Process a single frame using full inference (no cache).
+    
+    Returns
+    -------
+    tuple
+        (rendered_image, gt_image, K_matrix, masks) where images are torch tensors (H, W, 3)
+        and masks is a list of numpy arrays (H, W) boolean masks per object
     """
     # Load frame's image and masks
     image_path = os.path.join(paths['frames_path'], paths['image_names'][frame_index])
@@ -2432,8 +2484,8 @@ def process_frame_full_inference(args, paths, frame_index, inference):
     H, W, _ = image.shape
     
     masks = load_masks(mask_path)
-    if args.first_object_only:
-        masks = masks[:1]
+    if args.object_index is not None:
+        masks = [masks[args.object_index]]
     
     print(f"\n  Frame {frame_index}: Loaded image {image.shape}, {len(masks)} masks")
     
@@ -2451,7 +2503,7 @@ def process_frame_full_inference(args, paths, frame_index, inference):
         image=image
     )
     
-    pointmap_original = pointmap.copy() if args.with_background else None
+    pointmap_original = pointmap.copy() if not args.no_background else None
     
     # Transform to PyTorch3D convention
     pointmap = transform_to_pytorch3d_convention(pointmap)
@@ -2464,7 +2516,7 @@ def process_frame_full_inference(args, paths, frame_index, inference):
     new_scene_gs = transform_scene_to_r3_convention(scene_gs)
     
     # Add background if requested
-    if args.with_background and pointmap_original is not None:
+    if not args.no_background and pointmap_original is not None:
         background_gs = create_background_gaussians(
             image, pointmap_original, masks, K_matrix
         )
@@ -2475,4 +2527,732 @@ def process_frame_full_inference(args, paths, frame_index, inference):
     gt_image = torch.from_numpy(image).float() / 255.0
     rendered = torch.clamp(rendered.cpu(), 0.0, 1.0)
     
-    return rendered, gt_image, K_matrix
+    return rendered, gt_image, K_matrix, masks
+
+
+def evaluate_standard_mode(
+    args, paths, frame_indices, inference, tokens_dir,
+    evaluator, device, suffix="", save_renders=True,
+):
+    """
+    Evaluate frames using standard per-frame inference (no token averaging).
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    paths : dict
+        Dataset paths
+    frame_indices : list
+        List of frame indices to process
+    inference : Inference
+        Inference pipeline
+    tokens_dir : str
+        Directory where cached tokens are stored
+    evaluator : Evaluator
+        Evaluator instance
+    device : torch.device
+        Device to use
+    suffix : str
+        Suffix for output filenames
+    save_renders : bool
+        Whether to save rendered images
+        
+    Returns
+    -------
+    dict
+        Evaluation summary with metrics
+    """
+    rendered_frames = []
+    gt_frames = []
+    frame_indices_processed = []
+    per_object_data = {}  # per_object_data[obj_idx] = {'rendered': [], 'gt': []}
+    
+    for frame_idx, frame_index in enumerate(frame_indices):
+        print(f"\n{'='*60}")
+        print(f"Processing frame {frame_index} ({frame_idx + 1}/{len(frame_indices)})")
+        print(f"{'='*60}")
+        
+        rendered, gt_image, K_matrix, masks = process_frame_for_eval(
+            args, paths, frame_index, inference, tokens_dir
+        )
+        
+        # Convert to format expected by evaluator: (B, C, H, W)
+        rendered_eval = rendered.permute(2, 0, 1).unsqueeze(0).to(device)
+        gt_eval = gt_image.permute(2, 0, 1).unsqueeze(0).to(device)
+        
+        # Save comparison image if requested
+        if save_renders and args.save_renders:
+            render_dir = os.path.join(args.output_dir, "renders")
+            os.makedirs(render_dir, exist_ok=True)
+            output_path = os.path.join(render_dir, f"{args.scene_name}_frame_{frame_index:04d}{suffix}_comparison.png")
+            save_comparison_image(rendered, gt_image, output_path, frame_index)
+            print(f"  Saved comparison to {output_path}")
+        
+        # Store for sequence evaluation
+        rendered_frames.append(rendered_eval)
+        gt_frames.append(gt_eval)
+        frame_indices_processed.append(frame_index)
+        
+        # Initialize per-object data storage on first frame
+        if not per_object_data:
+            for obj_idx in range(len(masks)):
+                per_object_data[obj_idx] = {'rendered': [], 'gt': []}
+        
+        # Store per-object masked data
+        for obj_idx, mask in enumerate(masks):
+            if obj_idx not in per_object_data:
+                per_object_data[obj_idx] = {'rendered': [], 'gt': []}
+            # Convert mask to tensor and expand to (1, 1, H, W) for broadcasting
+            mask_tensor = torch.from_numpy(mask).float().to(device)
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            
+            # Apply mask to both rendered and gt images
+            rendered_masked = rendered_eval * mask_tensor
+            gt_masked = gt_eval * mask_tensor
+            
+            per_object_data[obj_idx]['rendered'].append(rendered_masked)
+            per_object_data[obj_idx]['gt'].append(gt_masked)
+    
+    # Evaluate and build summary using common function
+    return _build_evaluation_summary(
+        evaluator, rendered_frames, gt_frames, frame_indices_processed,
+        per_object_data, args, suffix,
+    )
+
+
+def _build_evaluation_summary(
+    evaluator, rendered_frames, gt_frames, frame_indices_processed,
+    per_object_data, args, suffix
+):
+    """
+    Build evaluation summary from collected frames (shared by both evaluation modes).
+    
+    Parameters
+    ----------
+    evaluator : Evaluator
+        Evaluator instance
+    rendered_frames : list
+        List of rendered frame tensors (B, C, H, W)
+    gt_frames : list
+        List of ground truth frame tensors (B, C, H, W)
+    frame_indices_processed : list
+        List of frame indices that were processed
+    per_object_data : dict
+        Dictionary mapping obj_idx -> {'rendered': [], 'gt': []}
+    args : argparse.Namespace
+        Command line arguments
+    suffix : str
+        Suffix for output filenames
+        
+    Returns
+    -------
+    dict
+        Evaluation summary with metrics
+    """
+    print(f"\n{'='*60}")
+    print("Evaluating sequence...")
+    print(f"{'='*60}")
+    
+    # Use Evaluator's evaluate_sequence method for full-frame metrics
+    seq_metrics = evaluator.evaluate_sequence(gt_frames, rendered_frames)
+    
+    # Print per-frame metrics (full frame)
+    print("\nPer-frame metrics (full frame):")
+    for i, frame_index in enumerate(frame_indices_processed):
+        print(f"  Frame {frame_index}: PSNR={seq_metrics['psnr_values'][i]:.2f} dB, "
+              f"SSIM={seq_metrics['ssim_values'][i]:.4f}, "
+              f"LPIPS={seq_metrics['lpip_values'][i]:.4f}")
+    
+    # Build frame_metrics with nested structure: full_frame, obj_0, obj_1, ...
+    frame_metrics = {
+        'full_frame': [
+            {
+                'frame_index': frame_indices_processed[i],
+                'psnr': seq_metrics['psnr_values'][i],
+                'ssim': seq_metrics['ssim_values'][i],
+                'lpip': seq_metrics['lpip_values'][i],
+            }
+            for i in range(len(frame_indices_processed))
+        ]
+    }
+    
+    # Evaluate per-object metrics
+    per_object_summary = {}
+    for obj_idx in sorted(per_object_data.keys()):
+        obj_key = f"obj_{obj_idx}"
+        if per_object_data[obj_idx]['rendered'] and per_object_data[obj_idx]['gt']:
+            obj_metrics = evaluator.evaluate_sequence(
+                per_object_data[obj_idx]['gt'],
+                per_object_data[obj_idx]['rendered']
+            )
+            frame_metrics[obj_key] = [
+                {
+                    'frame_index': frame_indices_processed[i],
+                    'psnr': obj_metrics['psnr_values'][i],
+                    'ssim': obj_metrics['ssim_values'][i],
+                    'lpip': obj_metrics['lpip_values'][i],
+                }
+                for i in range(len(frame_indices_processed))
+            ]
+            per_object_summary[obj_key] = {
+                'psnr_mean': float(obj_metrics['psnr_mean']),
+                'psnr_std': float(obj_metrics['psnr_std']),
+                'ssim_mean': float(obj_metrics['ssim_mean']),
+                'ssim_std': float(obj_metrics['ssim_std']),
+                'lpip_mean': float(obj_metrics['lpip_mean']),
+                'lpip_std': float(obj_metrics['lpip_std']),
+            }
+    
+    summary = {
+        'dataset': args.dataset,
+        'scene_name': args.scene_name,
+        'num_frames_evaluated': len(frame_indices_processed),
+        'frame_stride': args.frame_stride,
+        'with_background': not args.no_background,
+        'object_index': args.object_index,
+        'average_tokens': args.average_tokens,
+        'weighting_type': args.weighting_type if args.average_tokens else None,
+        'refine_poses': getattr(args, 'refine_poses', False) if args.average_tokens else False,
+        'refine_iterations': getattr(args, 'refine_iterations', None) if (args.average_tokens and getattr(args, 'refine_poses', False)) else None,
+        'suffix': suffix,
+        # Full-frame summary metrics
+        'psnr_mean': float(seq_metrics['psnr_mean']),
+        'psnr_std': float(seq_metrics['psnr_std']),
+        'psnr_min': float(seq_metrics['psnr_min']),
+        'psnr_max': float(seq_metrics['psnr_max']),
+        'ssim_mean': float(seq_metrics['ssim_mean']),
+        'ssim_std': float(seq_metrics['ssim_std']),
+        'ssim_min': float(seq_metrics['ssim_min']),
+        'ssim_max': float(seq_metrics['ssim_max']),
+        'lpip_mean': float(seq_metrics['lpip_mean']),
+        'lpip_std': float(seq_metrics['lpip_std']),
+        'lpip_min': float(seq_metrics['lpip_min']),
+        'lpip_max': float(seq_metrics['lpip_max']),
+        # Per-object summary metrics
+        'per_object_summary': per_object_summary,
+        # Frame-level metrics (full_frame, obj_0, obj_1, ...)
+        'frame_metrics': frame_metrics,
+    }
+    
+    # Save metrics to JSON if requested
+    if args.save_metrics:
+        metrics_path = os.path.join(args.output_dir, f"{args.scene_name}{suffix}_metrics.json")
+        with open(metrics_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n  Saved metrics to {metrics_path}")
+    
+    return summary
+
+
+def evaluate_with_canonical_objects(
+    args, paths, frame_indices, inference, tokens_dir,
+    canonical_gaussians, tokens_by_object, evaluator, device,
+    suffix="", save_renders=True,
+    per_frame_canonical=False
+):
+    """
+    Evaluate frames using canonical objects with per-frame poses.
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    paths : dict
+        Dataset paths
+    frame_indices : list
+        List of frame indices to process
+    inference : Inference
+        Inference pipeline
+    tokens_dir : str
+        Directory where cached tokens are stored
+    canonical_gaussians : dict
+        Dictionary mapping obj_idx -> canonical Gaussian (if per_frame_canonical=False)
+        OR dict[obj_idx][frame_idx] -> canonical Gaussian (if per_frame_canonical=True)
+    tokens_by_object : dict
+        Dictionary mapping obj_idx -> list of (frame_idx, decoder_input)
+    evaluator : Evaluator
+        Evaluator instance
+    device : torch.device
+        Device to use
+    suffix : str
+        Suffix for output filenames
+    save_renders : bool
+        Whether to save rendered images
+    per_frame_canonical : bool
+        If True, use per-frame canonical Gaussians (standard mode).
+        If False, use shared canonical Gaussians across frames (averaged-tokens mode).
+        
+    Returns
+    -------
+    dict
+        Evaluation summary with metrics
+    """
+    rendered_frames = []
+    gt_frames = []
+    frame_indices_processed = []
+    
+    # Filter frame_indices to only those that have poses for ALL objects
+    # (We need poses for every object to render a complete frame)
+    frame_sets_per_object = []
+    for obj_idx, tokens_list in tokens_by_object.items():
+        obj_frames = set(fid for fid, _ in tokens_list)
+        frame_sets_per_object.append(obj_frames)
+    
+    if frame_sets_per_object:
+        # Intersection: frames that have poses for ALL objects
+        available_frame_indices = frame_sets_per_object[0]
+        for obj_frames in frame_sets_per_object[1:]:
+            available_frame_indices = available_frame_indices & obj_frames
+    else:
+        available_frame_indices = set()
+    
+    frame_indices_to_process = [f for f in frame_indices if f in available_frame_indices]
+    
+    if len(frame_indices_to_process) < len(frame_indices):
+        print(f"\nNote: Only {len(frame_indices_to_process)} of {len(frame_indices)} requested frames have poses for all objects")
+        print(f"  Frames with complete poses: {sorted(available_frame_indices)}")
+        # Show which frames are missing for which objects
+        for obj_idx, tokens_list in tokens_by_object.items():
+            obj_frames = set(fid for fid, _ in tokens_list)
+            missing = set(frame_indices) - obj_frames
+            if missing:
+                print(f"  Object {obj_idx} missing frames: {sorted(missing)}")
+    
+    # Storage for per-object masked evaluation
+    # per_object_data[obj_idx] = {'rendered': [], 'gt': []}
+    per_object_data = {}
+    num_objects = len(tokens_by_object)  # Use tokens_by_object for count since it's always obj_idx -> list
+    
+    # Initialize per-object data storage
+    for obj_idx in range(num_objects):
+        per_object_data[obj_idx] = {'rendered': [], 'gt': []}
+    
+    # Process each frame
+    for frame_idx, frame_index in enumerate(frame_indices_to_process):
+        print(f"\n  Processing frame {frame_index} ({frame_idx + 1}/{len(frame_indices_to_process)})")
+        
+        # Process frame
+        rendered, gt_image, K_matrix, masks = process_frame_with_canonical_object(
+            args, paths, frame_index, inference, tokens_dir,
+            canonical_gaussians, tokens_by_object,
+            per_frame_canonical=per_frame_canonical
+        )
+        
+        # Convert to format expected by evaluator: (B, C, H, W)
+        rendered_eval = rendered.permute(2, 0, 1).unsqueeze(0).to(device)
+        gt_eval = gt_image.permute(2, 0, 1).unsqueeze(0).to(device)
+        
+        # Save comparison image if requested
+        if save_renders and args.save_renders:
+            render_dir = os.path.join(args.output_dir, "renders")
+            os.makedirs(render_dir, exist_ok=True)
+            output_path = os.path.join(render_dir, f"{args.scene_name}_frame_{frame_index:04d}{suffix}_comparison.png")
+            save_comparison_image(rendered, gt_image, output_path, frame_index)
+            print(f"    Saved comparison to {output_path}")
+        
+        # Store for full-frame sequence evaluation
+        rendered_frames.append(rendered_eval)
+        gt_frames.append(gt_eval)
+        frame_indices_processed.append(frame_index)
+        
+        # Store per-object masked data for evaluation
+        for obj_idx, mask in enumerate(masks):
+
+            # Convert mask to tensor and expand to (1, 1, H, W) for broadcasting
+            mask_tensor = torch.from_numpy(mask).float().to(device)
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            
+            # Apply mask to both rendered and gt images
+            # Mask is broadcast across channels
+            rendered_masked = rendered_eval * mask_tensor
+            gt_masked = gt_eval * mask_tensor
+            
+            per_object_data[obj_idx]['rendered'].append(rendered_masked)
+            per_object_data[obj_idx]['gt'].append(gt_masked)
+            
+            # # DEBUG: plot to file to check if masking is correct (the right mask is used)
+            # fig = plt.figure(figsize=(12, 4))
+            # ax1 = fig.add_subplot(1, 3, 1)
+            # ax1.imshow(rendered_masked.squeeze(0).permute(1, 2, 0).detach().cpu().numpy())
+            # ax1.set_title('Rendered Masked')
+            # ax2 = fig.add_subplot(1, 3, 2)
+            # ax2.imshow(gt_masked.squeeze(0).permute(1, 2, 0).detach().cpu().numpy())
+            # ax2.set_title('GT Masked')
+            # ax3 = fig.add_subplot(1, 3, 3)
+            # ax3.imshow(mask)
+            # ax3.set_title('Mask')
+            # debug_plot_path = f"debug_masking_obj{obj_idx}_frame{frame_index}.png"
+            # plt.savefig(debug_plot_path)
+            # plt.close(fig)
+            # print(f"DEBUG: Saved debug plot to {debug_plot_path}")
+            # exit(0)
+            
+    # Evaluate and build summary using common function
+    return _build_evaluation_summary(
+        evaluator, rendered_frames, gt_frames, frame_indices_processed,
+        per_object_data, args, suffix
+    )
+    
+    # # Evaluate full-frame metrics
+    # seq_metrics = evaluator.evaluate_sequence(gt_frames, rendered_frames)
+    
+    # # Build frame_metrics with nested structure: full_frame, obj_0, obj_1, ...
+    # frame_metrics = {
+    #     'full_frame': [
+    #         {
+    #             'frame_index': frame_indices_processed[i],
+    #             'psnr': seq_metrics['psnr_values'][i],
+    #             'ssim': seq_metrics['ssim_values'][i],
+    #             'lpip': seq_metrics['lpip_values'][i],
+    #         }
+    #         for i in range(len(frame_indices_processed))
+    #     ]
+    # }
+    
+    # # Evaluate per-object metrics
+    # per_object_summary = {}
+    # for obj_idx in range(num_objects):
+    #     obj_key = f"obj_{obj_idx}"
+    #     if per_object_data[obj_idx]['rendered'] and per_object_data[obj_idx]['gt']:
+    #         obj_metrics = evaluator.evaluate_sequence(
+    #             per_object_data[obj_idx]['gt'],
+    #             per_object_data[obj_idx]['rendered']
+    #         )
+    #         frame_metrics[obj_key] = [
+    #             {
+    #                 'frame_index': frame_indices_processed[i],
+    #                 'psnr': obj_metrics['psnr_values'][i],
+    #                 'ssim': obj_metrics['ssim_values'][i],
+    #                 'lpip': obj_metrics['lpip_values'][i],
+    #             }
+    #             for i in range(len(frame_indices_processed))
+    #         ]
+    #         per_object_summary[obj_key] = {
+    #             'psnr_mean': float(obj_metrics['psnr_mean']),
+    #             'psnr_std': float(obj_metrics['psnr_std']),
+    #             'ssim_mean': float(obj_metrics['ssim_mean']),
+    #             'ssim_std': float(obj_metrics['ssim_std']),
+    #             'lpip_mean': float(obj_metrics['lpip_mean']),
+    #             'lpip_std': float(obj_metrics['lpip_std']),
+    #         }
+
+    
+    # summary = {
+    #     'dataset': args.dataset,
+    #     'scene_name': args.scene_name,
+    #     'num_frames_evaluated': len(frame_indices_processed),
+    #     'frame_stride': args.frame_stride,
+    #     'with_background': not args.no_background,
+    #     'object_index': args.object_index,
+    #     'average_tokens': args.average_tokens,
+    #     'weighting_type': args.weighting_type if args.average_tokens else None,
+    #     'suffix': suffix,
+    #     # Full-frame summary metrics
+    #     'psnr_mean': float(seq_metrics['psnr_mean']),
+    #     'psnr_std': float(seq_metrics['psnr_std']),
+    #     'psnr_min': float(seq_metrics['psnr_min']),
+    #     'psnr_max': float(seq_metrics['psnr_max']),
+    #     'ssim_mean': float(seq_metrics['ssim_mean']),
+    #     'ssim_std': float(seq_metrics['ssim_std']),
+    #     'ssim_min': float(seq_metrics['ssim_min']),
+    #     'ssim_max': float(seq_metrics['ssim_max']),
+    #     'lpip_mean': float(seq_metrics['lpip_mean']),
+    #     'lpip_std': float(seq_metrics['lpip_std']),
+    #     'lpip_min': float(seq_metrics['lpip_min']),
+    #     'lpip_max': float(seq_metrics['lpip_max']),
+    #     # Per-object summary metrics
+    #     'per_object_summary': per_object_summary,
+    #     # Frame-level metrics (full_frame, obj_0, obj_1, ...)
+    #     'frame_metrics': frame_metrics,
+    # }
+    
+    # # Save metrics to JSON if requested
+    # if save_metrics and args.save_metrics:
+    #     metrics_path = os.path.join(args.output_dir, f"{args.scene_name}{suffix}_metrics.json")
+    #     with open(metrics_path, 'w') as f:
+    #         json.dump(summary, f, indent=2)
+    #     print(f"\n  Saved metrics to {metrics_path}")
+    
+    # return summary
+
+
+def print_evaluation_summary(summary, title="Evaluation Summary"):
+    """Print evaluation metrics in a formatted way."""
+    print(f"\n{'='*60}")
+    print(title)
+    print(f"{'='*60}")
+    print(f"Frames evaluated:  {summary['num_frames_evaluated']}")
+    
+    # Full-frame metrics
+    print("\n[Full Frame Metrics]")
+    print("PSNR (dB):")
+    print(f"  Mean: {summary['psnr_mean']:.2f} ± {summary['psnr_std']:.2f}")
+    print(f"  Range: [{summary['psnr_min']:.2f}, {summary['psnr_max']:.2f}]")
+    print("SSIM:")
+    print(f"  Mean: {summary['ssim_mean']:.4f} ± {summary['ssim_std']:.4f}")
+    print(f"  Range: [{summary['ssim_min']:.4f}, {summary['ssim_max']:.4f}]")
+    print("LPIPS (lower is better):")
+    print(f"  Mean: {summary['lpip_mean']:.4f} ± {summary['lpip_std']:.4f}")
+    print(f"  Range: [{summary['lpip_min']:.4f}, {summary['lpip_max']:.4f}]")
+    
+    # Per-object metrics if available
+    if 'per_object_summary' in summary and summary['per_object_summary']:
+        for obj_key, obj_metrics in summary['per_object_summary'].items():
+            print(f"\n[{obj_key} Metrics (masked)]")
+            print("PSNR (dB):")
+            print(f"  Mean: {obj_metrics['psnr_mean']:.2f} ± {obj_metrics['psnr_std']:.2f}")
+            print("SSIM:")
+            print(f"  Mean: {obj_metrics['ssim_mean']:.4f} ± {obj_metrics['ssim_std']:.4f}")
+            print("LPIPS (lower is better):")
+            print(f"  Mean: {obj_metrics['lpip_mean']:.4f} ± {obj_metrics['lpip_std']:.4f}")
+
+
+def plot_refinement_history(refinement_data, output_path):
+    """
+    Plot refinement loss history for all frames and objects in a grid.
+    
+    Creates a figure where:
+    - Rows: frames (sorted by frame index)
+    - Columns: loss types (total, rgb, silhouette, regularization)
+    
+    Parameters
+    ----------
+    refinement_data : dict
+        Refinement history data loaded from JSON
+    output_path : str
+        Path to save the output figure
+    """
+    # Collect all frames across all objects
+    all_frames = []
+    for obj_idx, obj_data in refinement_data['objects'].items():
+        for frame_idx, frame_data in obj_data.items():
+            all_frames.append({
+                'obj_idx': int(obj_idx),
+                'frame_idx': int(frame_idx),
+                'loss_history': frame_data['loss_history'],
+                'best_iteration': frame_data['best_iteration'],
+            })
+    
+    if not all_frames:
+        print("No refinement data to plot")
+        return
+    
+    # Sort by object index, then frame index
+    all_frames.sort(key=lambda x: (x['obj_idx'], x['frame_idx']))
+    
+    # Loss types to plot
+    loss_types = ['total', 'rgb', 'silhouette', 'regularization']
+    loss_titles = ['Total Loss', 'RGB Loss', 'Silhouette Loss', 'Regularization']
+    
+    n_frames = len(all_frames)
+    n_cols = len(loss_types)
+    
+    # Create figure with subplots
+    fig_height = max(3, 1.5 * n_frames)
+    fig, axes = plt.subplots(n_frames, n_cols, figsize=(4 * n_cols, fig_height), squeeze=False)
+    
+    for row_idx, frame_info in enumerate(all_frames):
+        loss_history = frame_info['loss_history']
+        best_iter = frame_info['best_iteration']
+        iterations = list(range(len(loss_history)))
+        
+        for col_idx, (loss_type, title) in enumerate(zip(loss_types, loss_titles)):
+            ax = axes[row_idx, col_idx]
+            
+            # Extract loss values for this type
+            values = [h[loss_type] for h in loss_history]
+            
+            # Plot the loss curve
+            ax.plot(iterations, values, 'b-', linewidth=1)
+            
+            # Mark best iteration
+            if best_iter < len(values):
+                ax.axvline(x=best_iter, color='r', linestyle='--', alpha=0.7, linewidth=0.8)
+                ax.scatter([best_iter], [values[best_iter]], color='r', s=20, zorder=5)
+            
+            # Labels
+            if row_idx == 0:
+                ax.set_title(title, fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(f"Obj {frame_info['obj_idx']}, F{frame_info['frame_idx']}", fontsize=8)
+            if row_idx == n_frames - 1:
+                ax.set_xlabel('Iteration', fontsize=8)
+            
+            # Formatting
+            ax.tick_params(axis='both', labelsize=7)
+            ax.grid(True, alpha=0.3)
+            
+            # Scientific notation for small values (regularization)
+            if loss_type == 'regularization':
+                ax.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved refinement loss plot to {output_path}")
+
+
+def process_frame_for_eval(args, paths, frame_index, inference, tokens_dir):
+    """
+    Process a single frame, using cache if available.
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    paths : dict
+        Dataset paths
+    frame_index : int
+        Frame index to process
+    inference : Inference
+        Inference pipeline
+    tokens_dir : str
+        Directory where cached tokens are stored
+        
+    Returns
+    -------
+    tuple
+        (rendered_image, gt_image, K_matrix, masks) where images are torch tensors (H, W, 3)
+        and masks is a list of numpy arrays (H, W) boolean masks per object
+    """
+    # First try to load from cache
+    if not args.no_cache:
+        result = process_frame_from_cache(args, paths, frame_index, inference, tokens_dir)
+        if result is not None:
+            # print info about loaded cache
+            print(f"    Loaded cached tokens for frame {frame_index} from {tokens_dir}")
+            return result
+        print("    Cache not found, running full inference...")
+    
+    # Fall back to full inference
+    return process_frame_full_inference(args, paths, frame_index, inference)
+
+
+def process_frame_with_canonical_object(args, paths, frame_index, inference, tokens_dir,
+                                         canonical_gaussians, tokens_by_object,
+                                         per_frame_canonical=False):
+    """
+    Process a single frame using pre-decoded canonical Gaussians warped with per-frame pose.
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    paths : dict
+        Dataset paths
+    frame_index : int
+        Frame index to process
+    inference : Inference
+        Inference pipeline
+    tokens_dir : str
+        Directory where cached tokens are stored
+    canonical_gaussians : dict
+        Dictionary mapping obj_idx -> decoded Gaussian object (if per_frame_canonical=False)
+        OR dict[obj_idx][frame_idx] -> decoded Gaussian object (if per_frame_canonical=True)
+    tokens_by_object : dict
+        Dictionary mapping obj_idx -> list of (frame_idx, decoder_input) with poses
+    per_frame_canonical : bool
+        If True, use per-frame canonical Gaussians (standard mode).
+        If False, use shared canonical Gaussians across frames (averaged-tokens mode).
+        
+    Returns
+    -------
+    tuple
+        (rendered_image, gt_image, K_matrix, masks) where images are torch tensors (H, W, 3)
+        and masks is a list of numpy arrays (H, W) boolean masks per object
+    """
+    # Load frame's image and masks
+    image_path = os.path.join(paths['frames_path'], paths['image_names'][frame_index])
+    mask_path = os.path.join(paths['masks_path'], paths['mask_names'][frame_index])
+    
+    image = load_image(image_path)
+    image = image[..., :3]
+    H, W, _ = image.shape
+    
+    masks = load_masks(mask_path)
+    if args.object_index is not None:
+        if args.object_index < len(masks):
+            masks = [masks[args.object_index]]
+        else:
+            print(f"Warning: --object-index {args.object_index} out of range (only {len(masks)} masks)")
+            return None
+    
+    # Load depth and compute K_matrix (needed for rendering)
+    depth_names_for_frame = []
+    if paths['dataset_type'] == 'kubric4d' and paths['depth_names']:
+        depth_names_for_frame = [paths['depth_names'][frame_index]]
+    
+    pointmap, K_matrix, valid_mask = load_and_process_depth(
+        paths['frames_path'],
+        depth_names_for_frame,
+        W, H,
+        use_moge=args.use_moge,
+        inference=inference,
+        image=image
+    )
+    
+    pointmap_original = pointmap.copy() if not args.no_background else None
+    
+    # Get per-frame poses from cached tokens
+    # Build outputs list with canonical gaussian + per-frame pose
+    outputs = []
+    
+    for obj_idx in sorted(tokens_by_object.keys()):
+        
+        # Get the canonical Gaussian for this object (and frame, if per_frame_canonical)
+        if per_frame_canonical:
+            if obj_idx not in canonical_gaussians or frame_index not in canonical_gaussians[obj_idx]:
+                print(f"    Warning: No canonical Gaussian for object {obj_idx} frame {frame_index}, skipping")
+                continue
+            canonical_gs = canonical_gaussians[obj_idx][frame_index]
+        else:
+            if obj_idx not in canonical_gaussians:
+                print(f"    Warning: No canonical Gaussian for object {obj_idx}, skipping")
+                continue
+            canonical_gs = canonical_gaussians[obj_idx]
+        
+        # Find the pose for this frame
+        frame_pose = None
+        for fid, decoder_input in tokens_by_object[obj_idx]:
+            if fid == frame_index:
+                frame_pose = decoder_input
+                break
+        
+        if frame_pose is None:
+            print(f"    Warning: No pose found for object {obj_idx} at frame {frame_index}, skipping")
+            continue
+        
+        # Build output with canonical gaussian and per-frame pose
+        output = {
+            'gaussian': [canonical_gs],  # Wrap in list for make_scene
+            'rotation': frame_pose['rotation'],
+            'translation': frame_pose['translation'],
+            'scale': frame_pose['scale'],
+        }
+        outputs.append(output)
+    
+    # Create combined scene from all outputs (in PyTorch3D convention)
+    scene_gs = make_scene(*outputs)
+    
+    # Transform scene from PyTorch3D to R3 convention
+    new_scene_gs = transform_scene_to_r3_convention(scene_gs)
+    
+    # Add background Gaussians if requested
+    if not args.no_background and pointmap_original is not None:
+        background_gs = create_background_gaussians(
+            image, pointmap_original, masks, K_matrix
+        )
+        new_scene_gs = join_gaussians(background_gs, new_scene_gs)
+    
+    # Render Gaussians to image
+    rendered = render_gaussians_to_image(new_scene_gs, K_matrix, W, H)
+    
+    # Convert ground truth to tensor
+    gt_image = torch.from_numpy(image).float() / 255.0
+    
+    # Clamp rendered to [0, 1]
+    rendered = torch.clamp(rendered.cpu(), 0.0, 1.0)
+    
+    return rendered, gt_image, K_matrix, masks
+

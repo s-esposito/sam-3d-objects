@@ -9,3 +9,4 @@ __pycache__
 notebook/outputs/
 notebook/gaussians/
 custom/results/*
+custom/sea_raft_core/checkpoints/*

@@ -47,7 +47,7 @@ python custom/evaluate_sequence.py --dataset davis --scene-name car-turn
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--use-moge` | flag | False | Use MoGe depth model instead of ground truth depth. **Required for DAVIS** (auto-enabled) |
-| `--first-object-only` | flag | False | Only process the first object/mask in each frame |
+| `--object-index 0` | flag | False | Only process the first object/mask in each frame |
 | `--seed` | int | `42` | Random seed for inference |
 | `--with-background` | flag | False | Add background Gaussians from non-masked regions |
 | `--no-cache` | flag | False | Ignore cached tokens and run full inference |

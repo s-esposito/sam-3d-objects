@@ -1,2 +1,0 @@
-# python notebook/demo.py --dataset davis --no-cache --with-background --frame-index 60  --first-object-only 
-# python notebook/demo.py --dataset kubric4d --no-cache --with-background --frame-index 0 --use-moge --first-object-only 

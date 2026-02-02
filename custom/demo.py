@@ -19,11 +19,11 @@ Usage Examples:
     # DAVIS dataset with MoGe depth estimation
     python custom/demo.py --dataset davis --scene-name car-turn --frame-index 0
     
-    # Include background in reconstruction
-    python custom/demo.py --dataset kubric4d --scene-name scn02719 --frame-index 0 --with-background
+    # Disable background in reconstruction (background is on by default)
+    python custom/demo.py --dataset kubric4d --scene-name scn02719 --frame-index 0 --no-background
     
     # Process only first object
-    python custom/demo.py --dataset kubric4d --scene-name scn02719 --frame-index 0 --first-object-only
+    python custom/demo.py --dataset kubric4d --scene-name scn02719 --frame-index 0 --object-index 0
     
     # Custom output formats
     python custom/demo.py --dataset kubric4d --scene-name scn02719 --frame-index 0 --formats gaussian mesh
@@ -32,9 +32,9 @@ Usage Examples:
     python custom/demo.py --dataset kubric4d --dataset-path /path/to/kubric4d --scene-name scn02719
 
 Output:
-    - Renders saved to: custom/results/{dataset}/renders (with .png suffix)
-    - Gaussians saved to: custom/results/{dataset}/gaussians (with _gaussians.ply suffix)
-    - Meshes saved to: custom/results/{dataset}/meshes (with _mesh.obj suffix)
+    - Renders saved to: custom/results/{dataset}/perframe/renders/ (with .png suffix)
+    - Gaussians saved to: custom/results/{dataset}/perframe/gaussians/ (with _gaussians.ply suffix)
+    - Meshes saved to: custom/results/{dataset}/perframe/meshes/ (with _mesh.obj suffix)
     - SLAT tokens: custom/results/{dataset}/tokens/
 """
 import os
@@ -53,7 +53,9 @@ from utils import (
     transform_scene_to_r3_convention,
     create_background_gaussians,
     load_image, 
-    load_masks
+    load_masks,
+    save_tokens,
+    render_and_compare
 )
 
 import torch
@@ -176,9 +178,10 @@ def parse_args():
         help="Use MoGe depth model instead of ground truth depth (required for DAVIS)",
     )
     parser.add_argument(
-        "--first-object-only",
-        action="store_true",
-        help="Only process the first object/mask (useful for debugging)",
+        "--object-index",
+        type=int,
+        default=None,
+        help="Only process the object at this index (0-based). If not specified, processes all objects.",
     )
     parser.add_argument(
         "--seed",
@@ -189,9 +192,9 @@ def parse_args():
     
     # Background and joint predictions
     parser.add_argument(
-        "--with-background",
+        "--no-background",
         action="store_true",
-        help="Add background Gaussians from non-masked regions",
+        help="Disable adding background Gaussians from non-masked regions",
     )
     
     # Output options
@@ -244,9 +247,10 @@ def main():
         args.output_dir = os.path.join(SCRIPT_DIR, f"results/{args.dataset}")
     
     # Create subdirectories for organized output
-    renders_dir = os.path.join(args.output_dir, "renders")
-    gaussians_dir = os.path.join(args.output_dir, "gaussians")
-    meshes_dir = os.path.join(args.output_dir, "meshes")
+    # Renders go directly in output_dir, gaussians/meshes go in perframe subfolder
+    renders_dir = os.path.join(args.output_dir, "perframe", "renders")
+    gaussians_dir = os.path.join(args.output_dir, "perframe", "gaussians")
+    meshes_dir = os.path.join(args.output_dir, "perframe", "meshes")
     tokens_dir = os.path.join(args.output_dir, "tokens")
     
     os.makedirs(renders_dir, exist_ok=True)
@@ -280,8 +284,8 @@ def main():
         print(f"Frame stride:      {args.frame_stride}")
         print(f"Frames to process: {len(frame_indices)} frames")
     print(f"Use MoGe depth:    {args.use_moge}")
-    print(f"First object only: {args.first_object_only}")
-    print(f"With background:   {args.with_background}")
+    print(f"Object index:      {args.object_index if args.object_index is not None else 'all'}")
+    print(f"With background:   {not args.no_background}")
     print(f"Seed:              {args.seed}")
     print(f"Output directory:  {args.output_dir}")
     print(f"  Renders:         {renders_dir}")
@@ -335,16 +339,20 @@ def process_frame(args, paths, frame_index, inference, renders_dir, gaussians_di
           f"min={image.min()}, max={image.max()}")
     print(f"Loaded {len(masks)} masks")
     
-    # Filter masks if only processing first object
-    if args.first_object_only:
-        masks = masks[:1]
-        print("--first-object-only: Processing only 1 mask")
+    # Filter masks if only processing a specific object
+    if args.object_index is not None:
+        if args.object_index < len(masks):
+            masks = [masks[args.object_index]]
+            print(f"--object-index {args.object_index}: Processing only 1 mask")
+        else:
+            print(f"Warning: --object-index {args.object_index} out of range (only {len(masks)} masks available)")
+            return
     
     # Modify cache name based on configuration to avoid conflicts
     cache_parts = [args.scene_name, f"f{frame_index}"]
-    if args.first_object_only:
-        cache_parts.append("first")
-    if args.with_background:
+    if args.object_index is not None:
+        cache_parts.append(f"obj{args.object_index}")
+    if not args.no_background:
         cache_parts.append("bg")
     cache_scene_name = "_".join(cache_parts)
     
@@ -369,7 +377,7 @@ def process_frame(args, paths, frame_index, inference, renders_dir, gaussians_di
     )
     
     # Keep copy of original pointmap for background rendering
-    if args.with_background:
+    if not args.no_background:
         pointmap_original = pointmap.copy()
     
     # Visualize pointmap
@@ -390,8 +398,14 @@ def process_frame(args, paths, frame_index, inference, renders_dir, gaussians_di
         # Run inference on all masks
         outputs = run_inference_on_masks(inference, image, masks, pointmap, seed=args.seed)
         
-        # Cache results
-        save_tokens(tokens_dir, cache_scene_name, outputs)
+        # Cache results with frame and object index information
+        if args.object_index is not None:
+            # Processing single object
+            object_indices = [args.object_index]
+        else:
+            # Processing all objects
+            object_indices = list(range(len(outputs)))
+        save_tokens(tokens_dir, cache_scene_name, outputs, frame_index, object_indices)
     
     # Save each raw object (before layout transform) for debugging
     from copy import deepcopy
@@ -442,8 +456,8 @@ def process_frame(args, paths, frame_index, inference, renders_dir, gaussians_di
     # new_scene_gs.save_ply(debug_ply_path_r3)
     # print(f"Saved R3 convention Gaussian scene to {debug_ply_path_r3}")
     
-    # Add background Gaussians if requested
-    if args.with_background and pointmap_original is not None:
+    # Add background Gaussians (enabled by default)
+    if not args.no_background and pointmap_original is not None:
         print("Creating background Gaussians...")
         background_gs = create_background_gaussians(
             image, pointmap_original, masks, K_matrix
