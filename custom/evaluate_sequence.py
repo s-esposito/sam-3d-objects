@@ -45,17 +45,34 @@ Usage Examples:
     
     # Refine poses with custom settings
     python custom/evaluate_sequence.py --dataset kubric4d --scene-name scn02719 --average-tokens --refine-poses --refine-iterations 200 --refine-lr-rotation 0.005 --refine-lr-translation 0.0005 --refine-lr-scale 0.0005
+    
+    # Refine poses with scale refinement enabled (perframe)
+    python custom/evaluate_sequence.py --dataset kubric4d --scene-name scn02719 --refine-poses --refine-scale perframe
+    
+    # Use median scale for consistent object sizing across frames
+    python custom/evaluate_sequence.py --dataset kubric4d --scene-name scn02719 --median-scale
 
 Weighting Types (for --average-tokens mode):
     - uniform:    Simple average of all frame tokens (default)
     - mask-area:  Weight by mask visibility - frames with larger masks contribute more
     - mask-error: Weight by inverse rendering error - frames with lower error contribute more
 
+Median Scale (--median-scale):
+    Uses the median of all per-frame predicted scales for each object across the
+    sequence. This provides more consistent object sizing when the per-frame scale
+    predictions vary significantly.
+
+Scale Refinement (--refine-scale):
+    Controls how scale is handled during pose refinement:
+    - none:     Do not refine scale, use initial predicted scale (default)
+    - perframe: Refine scale independently for each frame
+    - global:   Optimize a single scale for all frames (not implemented yet)
+
 Pose Refinement (--refine-poses):
-    Optimizes per-frame poses (rotation, translation, scale) using differentiable
+    Optimizes per-frame poses (rotation, translation) using differentiable
     Gaussian rendering. Each frame's Gaussian is treated as a "local space" canonical
     object, and its local-to-world transformation is refined to minimize RGB and
-    silhouette loss in the masked region.
+    silhouette loss in the masked region. Scale is only refined if --refine-scale is set.
     
     - With --average-tokens: Refines poses relative to a canonical Gaussian created
       by averaging SLAT tokens across frames.
@@ -83,6 +100,7 @@ from utils import (
     setup_paths,
     redecode_slat,
     average_slat_tokens,
+    apply_median_scale_to_tokens,
     compute_frame_weights_from_error,
     compute_frame_weights_from_masks,
     ensure_all_frames_have_tokens,
@@ -167,6 +185,11 @@ def parse_args():
         action="store_true",
         help="Ignore cached tokens and run full inference",
     )
+    parser.add_argument(
+        "--median-scale",
+        action="store_true",
+        help="Use median of per-frame predicted scales for each object across the sequence",
+    )
     
     # Token averaging options
     parser.add_argument(
@@ -187,6 +210,13 @@ def parse_args():
         "--refine-poses",
         action="store_true",
         help="Refine per-frame poses using differentiable Gaussian rendering",
+    )
+    parser.add_argument(
+        "--refine-scale",
+        type=str,
+        choices=["none", "perframe", "global"],
+        default="none",
+        help="Scale refinement mode: 'none' (keep predicted scale), 'perframe' (refine scale independently per frame), 'global' (optimize single scale across sequence, not implemented)",
     )
     parser.add_argument(
         "--refine-iterations",
@@ -210,7 +240,7 @@ def parse_args():
         "--refine-lr-scale",
         type=float,
         default=0.001,
-        help="Learning rate for scale refinement",
+        help="Learning rate for scale refinement (only used when --refine-scale is 'perframe')",
     )
     
     # Output options
@@ -294,15 +324,17 @@ def main():
     print(f"Object index:      {args.object_index if args.object_index is not None else 'all'}")
     print(f"With background:   {not args.no_background}")
     print(f"Use cache:         {not args.no_cache}")
+    print(f"Median scale:      {args.median_scale}")
     print(f"Average tokens:    {args.average_tokens}")
     if args.average_tokens:
         print(f"Weighting type:    {args.weighting_type}")
-        print(f"Refine poses:      {args.refine_poses}")
-        if args.refine_poses:
-            print(f"  Iterations:      {args.refine_iterations}")
-            print(f"  LR rotation:     {args.refine_lr_rotation}")
-            print(f"  LR translation:  {args.refine_lr_translation}")
-            print(f"  LR scale:        {args.refine_lr_scale}")
+    print(f"Refine poses:      {args.refine_poses}")
+    if args.refine_poses:
+        print(f"  Iterations:      {args.refine_iterations}")
+        print(f"  LR rotation:     {args.refine_lr_rotation}")
+        print(f"  LR translation:  {args.refine_lr_translation}")
+        print(f"  LR scale:        {args.refine_lr_scale}")
+        print(f"  Refine scale:    {args.refine_scale}")
     print(f"Tokens directory:  {tokens_dir}")
     print(f"Output directory:  {args.output_dir}")
     print("=" * 60)
@@ -334,6 +366,11 @@ def main():
             return
         
         print(f"\nFound tokens for {len(tokens_by_object)} objects")
+        
+        # Apply median scale if requested
+        if args.median_scale:
+            print("\nApplying median scale normalization...")
+            apply_median_scale_to_tokens(tokens_by_object)
         
         # Update frame_indices to include all frames that now have tokens
         # (should match frame_indices after ensure_all_frames_have_tokens)
@@ -426,6 +463,7 @@ def main():
                 lr_rotation=args.refine_lr_rotation,
                 lr_translation=args.refine_lr_translation,
                 lr_scale=args.refine_lr_scale,
+                refine_scale=args.refine_scale,
             )
             
             tokens_by_object = refine_poses_for_sequence(
@@ -547,6 +585,7 @@ def main():
                 lr_rotation=args.refine_lr_rotation,
                 lr_translation=args.refine_lr_translation,
                 lr_scale=args.refine_lr_scale,
+                refine_scale=args.refine_scale,
                 verbose=True,
             )
             
@@ -555,6 +594,7 @@ def main():
             print(f"  LR (rotation):    {refine_config.lr_rotation}")
             print(f"  LR (translation): {refine_config.lr_translation}")
             print(f"  LR (scale):       {refine_config.lr_scale}")
+            print(f"  Refine scale:     {refine_config.refine_scale}")
             
             # Load all frame tokens
             print("\nLoading cached tokens for all frames...")
@@ -572,6 +612,11 @@ def main():
                     (fid, di) for fid, di in tokens_by_object[obj_idx] 
                     if fid in frame_indices
                 ]
+            
+            # Apply median scale if requested
+            if args.median_scale:
+                print("\nApplying median scale normalization...")
+                apply_median_scale_to_tokens(tokens_by_object)
             
             # Decode per-frame canonical Gaussians
             print("\nDecoding per-frame Gaussians...")
@@ -697,11 +742,47 @@ def main():
                 )
                 plot_refinement_history(refinement_data, plot_path)
         else:
-            # No refinement - just evaluate once
-            summary = evaluate_standard_mode(
-                args, paths, frame_indices, inference, tokens_dir,
-                evaluator, device, suffix="", save_renders=True
-            )
+            # No refinement
+            if args.median_scale:
+                # With median scale: need to load all tokens, apply median, and use canonical path
+                print("\nLoading cached tokens for median scale computation...")
+                tokens_by_object = load_all_frame_tokens(
+                    tokens_dir, args.scene_name, args.object_index, not args.no_background
+                )
+                
+                if not tokens_by_object:
+                    print("\nError: No cached tokens found. Run demo.py first to cache tokens.")
+                    return
+                
+                # Filter to requested frame_indices
+                for obj_idx in tokens_by_object:
+                    tokens_by_object[obj_idx] = [
+                        (fid, di) for fid, di in tokens_by_object[obj_idx] 
+                        if fid in frame_indices
+                    ]
+                
+                # Apply median scale
+                print("\nApplying median scale normalization...")
+                apply_median_scale_to_tokens(tokens_by_object)
+                
+                # Decode per-frame canonical Gaussians
+                print("\nDecoding per-frame Gaussians...")
+                pipeline = inference._pipeline
+                canonical_gaussians = decode_per_frame_gaussians(tokens_by_object, pipeline)
+                
+                suffix = "_median_scale"
+                summary = evaluate_with_canonical_objects(
+                    args, paths, frame_indices, inference, tokens_dir,
+                    canonical_gaussians, tokens_by_object, evaluator, device,
+                    suffix=suffix, save_renders=True,
+                    per_frame_canonical=True
+                )
+            else:
+                # Standard evaluation without median scale
+                summary = evaluate_standard_mode(
+                    args, paths, frame_indices, inference, tokens_dir,
+                    evaluator, device, suffix="", save_renders=True
+                )
             
             if summary:
                 print_evaluation_summary(summary, "Sequence Evaluation Summary")

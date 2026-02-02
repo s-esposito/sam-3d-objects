@@ -28,6 +28,12 @@ class RefinementConfig:
     lr_translation: float = 0.001
     lr_scale: float = 0.001
     
+    # Scale refinement mode: "none", "perframe", or "global"
+    # - "none": Do not refine scale, use initial predicted scale
+    # - "perframe": Refine scale independently for each frame
+    # - "global": Optimize a single scale for all frames (not implemented)
+    refine_scale: str = "none"
+    
     # Loss weights
     silhouette_weight: float = 0.1
     regularization_weight: float = 0.001
@@ -1589,6 +1595,55 @@ def load_all_frame_tokens(tokens_dir, scene_name, object_index=None, with_backgr
     return tokens_by_object
 
 
+def apply_median_scale_to_tokens(tokens_by_object):
+    """
+    Apply median scale normalization to tokens.
+    
+    For each object, computes the median of all per-frame predicted scales
+    and replaces each frame's scale with that median. This provides more
+    consistent object sizing across the sequence.
+    
+    Parameters
+    ----------
+    tokens_by_object : dict
+        Dictionary mapping object_index -> list of (frame_index, decoder_input) tuples
+        
+    Returns
+    -------
+    dict
+        Modified tokens_by_object with median scales applied (modifies in place)
+    """
+    for obj_idx, tokens_list in tokens_by_object.items():
+        if len(tokens_list) == 0:
+            continue
+        
+        # Collect all scales for this object
+        scales = []
+        for frame_idx, decoder_input in tokens_list:
+            scale = decoder_input['scale']
+            if isinstance(scale, torch.Tensor):
+                scales.append(scale.cpu().numpy())
+            else:
+                scales.append(np.array(scale))
+        
+        scales = np.array(scales)  # Shape: (num_frames, 3) or (num_frames,) depending on scale format
+        
+        # Compute median scale
+        median_scale = np.median(scales, axis=0)
+        
+        print(f"  Object {obj_idx}: median scale = {median_scale}")
+        print(f"    Scale range: min={scales.min(axis=0)}, max={scales.max(axis=0)}")
+        
+        # Apply median scale to all frames
+        for frame_idx, decoder_input in tokens_list:
+            if isinstance(decoder_input['scale'], torch.Tensor):
+                decoder_input['scale'] = torch.tensor(median_scale, dtype=decoder_input['scale'].dtype, device=decoder_input['scale'].device)
+            else:
+                decoder_input['scale'] = median_scale
+    
+    return tokens_by_object
+
+
 def compute_and_cache_frame_tokens(
     args, paths, frame_index, inference, tokens_dir
 ):
@@ -1988,14 +2043,32 @@ def refine_pose_for_frame(
         initial_scale_scalar = initial_scale_flat.mean().view(1)
     else:
         initial_scale_scalar = initial_scale_flat[:1]
-    opt_scale_scalar = initial_scale_scalar.clone().detach().requires_grad_(True)
+    
+    # Handle scale refinement based on config
+    if config.refine_scale == "global":
+        raise NotImplementedError(
+            "Global scale refinement (optimizing a single scale across all frames) "
+            "is not implemented yet. Use 'none' or 'perframe' instead."
+        )
+    
+    # Set up scale parameter based on refinement mode
+    if config.refine_scale == "perframe":
+        # Optimize scale independently for each frame
+        opt_scale_scalar = initial_scale_scalar.clone().detach().requires_grad_(True)
+    else:
+        # config.refine_scale == "none": Do not optimize scale
+        opt_scale_scalar = initial_scale_scalar.clone().detach().requires_grad_(False)
     
     # Create optimizer with different learning rates
-    optimizer = torch.optim.Adam([
+    # Only include scale in optimizer if we're refining it
+    param_groups = [
         {'params': [opt_rotation], 'lr': config.lr_rotation},
         {'params': [opt_translation], 'lr': config.lr_translation},
-        {'params': [opt_scale_scalar], 'lr': config.lr_scale},
-    ])
+    ]
+    if config.refine_scale == "perframe":
+        param_groups.append({'params': [opt_scale_scalar], 'lr': config.lr_scale})
+    
+    optimizer = torch.optim.Adam(param_groups)
     
     # Background color (white for evaluation)
     bg_color = torch.zeros(3, device=device)
@@ -2141,8 +2214,12 @@ def refine_pose_for_frame(
         opt_rotation_normalized = opt_rotation / opt_rotation.norm()
         reg_rot = ((opt_rotation_normalized - initial_rotation / initial_rotation.norm()) ** 2).sum()
         reg_trans = ((opt_translation - initial_translation) ** 2).sum()
-        reg_scale = ((opt_scale_scalar - initial_scale_scalar) ** 2).sum()
-        weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans + reg_scale)
+        # Only add scale regularization if scale is being optimized
+        if config.refine_scale == "perframe":
+            reg_scale = ((opt_scale_scalar - initial_scale_scalar) ** 2).sum()
+            weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans + reg_scale)
+        else:
+            weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans)
         
         # Total loss
         loss = rgb_loss + weighted_silhouette_loss + weighted_reg_loss
@@ -2162,10 +2239,13 @@ def refine_pose_for_frame(
         if iteration == 0 and config.verbose:
             rot_grad = opt_rotation.grad
             trans_grad = opt_translation.grad
-            scale_grad = opt_scale_scalar.grad
             print(f"      [Gradient check] rotation grad: {rot_grad.abs().max().item() if rot_grad is not None else 'None':.6e}")
             print(f"      [Gradient check] translation grad: {trans_grad.abs().max().item() if trans_grad is not None else 'None':.6e}")
-            print(f"      [Gradient check] scale grad: {scale_grad.abs().max().item() if scale_grad is not None else 'None':.6e}")
+            if config.refine_scale == "perframe":
+                scale_grad = opt_scale_scalar.grad
+                print(f"      [Gradient check] scale grad: {scale_grad.abs().max().item() if scale_grad is not None else 'None':.6e}")
+            else:
+                print(f"      [Gradient check] scale grad: N/A (scale refinement disabled)")
             print(f"      [Gradient check] transformed_xyz requires_grad: {transformed_xyz.requires_grad}")
             print(f"      [Gradient check] rgb requires_grad: {rgb.requires_grad}")
             print(f"      [Gradient check] loss requires_grad: {loss.requires_grad}")
@@ -2532,7 +2612,7 @@ def process_frame_full_inference(args, paths, frame_index, inference):
 
 def evaluate_standard_mode(
     args, paths, frame_indices, inference, tokens_dir,
-    evaluator, device, suffix="", save_renders=True,
+    evaluator, device, suffix="", save_renders=True, median_scales=None,
 ):
     """
     Evaluate frames using standard per-frame inference (no token averaging).
@@ -2557,6 +2637,9 @@ def evaluate_standard_mode(
         Suffix for output filenames
     save_renders : bool
         Whether to save rendered images
+    median_scales : dict, optional
+        Dictionary mapping obj_idx -> median scale tensor. If provided, these scales
+        will be used instead of per-frame predicted scales.
         
     Returns
     -------
