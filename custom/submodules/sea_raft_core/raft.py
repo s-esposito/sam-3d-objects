@@ -4,9 +4,13 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
+from pathlib import Path
 from huggingface_hub import PyTorchModelHubMixin
 
-sys.path.append("sea_raft_core")
+# Add current directory to path for local imports
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
 from update import BasicUpdateBlock
 from corr import CorrBlock
 from utils.utils import coords_grid, InputPadder

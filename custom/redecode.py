@@ -59,7 +59,7 @@ from pytorch3d.io import load_objs_as_meshes
 
 from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp  # noqa: F401
 from inference import Inference
-from utils import (
+from custom.utils import (
     save_mesh_to_obj,
     redecode_slat,
     average_slat_tokens,

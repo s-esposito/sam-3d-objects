@@ -31,16 +31,110 @@ class RefinementConfig:
     # Scale refinement mode: "none", "perframe", or "global"
     # - "none": Do not refine scale, use initial predicted scale
     # - "perframe": Refine scale independently for each frame
-    # - "global": Optimize a single scale for all frames (not implemented)
+    # - "global": Optimize a single scale for all frames across the sequence
     refine_scale: str = "none"
     
+    # Batch size for global scale refinement (0 or negative = all frames)
+    batch_size: int = 0
+    
     # Loss weights
-    silhouette_weight: float = 0.1
+    silhouette_weight: float = 0.0
+    
+    # Whether to use regularization loss (penalizes deviation from initial pose)
+    use_regularization: bool = False
     regularization_weight: float = 0.001
+    
+    # Optical flow correspondence loss
+    use_flow: bool = False  # Whether to use optical flow loss in refinement
+    flow_weight: float = 0.1  # Weight for optical flow correspondence loss
+    
+    # Flow model for correspondence loss (lazy loaded)
+    flow_model: object = None
     
     # Logging
     verbose: bool = True
     log_interval: int = 20
+
+
+def _get_flow_model():
+    """Lazy-load the optical flow model for correspondence loss."""
+    import sys
+    from pathlib import Path
+    
+    # Add sea_raft_core to path
+    custom_dir = Path(__file__).resolve().parents[0]
+    sea_raft_path = custom_dir.parent / "submodules" / "sea_raft_core"
+    if str(sea_raft_path) not in sys.path:
+        sys.path.insert(0, str(sea_raft_path))
+    
+    from raft import RAFT
+    from utils.utils import json_to_args
+    
+    ckpt_path = str(sea_raft_path / "checkpoints" / "Tartan-C-T-TSKH-spring540x960-M.pth")
+    json_path = str(sea_raft_path / "configs" / "spring-L.json")
+    
+    args = json_to_args(json_path)
+    model = RAFT(args)
+    model.load_ckpt(ckpt_path)
+    model.cuda()
+    model.eval()
+    
+    return model
+
+
+def _compute_flow_loss(rendered_rgb, gt_rgb, mask, flow_model):
+    """
+    Compute optical flow magnitude between rendered and GT images (monitoring only).
+    
+    The flow from rendered to GT tells us where each rendered pixel should move
+    to match the GT. We want this flow to be zero (pixels already aligned).
+    
+    NOTE: This is a monitoring metric only - gradients do NOT flow back through
+    the flow model due to internal .detach() calls in RAFT's iterative refinement.
+    The flow magnitude tracks alignment quality but does not contribute to optimization.
+    
+    Parameters
+    ----------
+    rendered_rgb : torch.Tensor
+        Rendered image (H, W, 3) in [0, 1]
+    gt_rgb : torch.Tensor
+        Ground truth image (H, W, 3) in [0, 1]
+    mask : torch.Tensor
+        Object mask (H, W), boolean
+    flow_model : RAFT
+        Pre-loaded optical flow model
+        
+    Returns
+    -------
+    torch.Tensor
+        Flow magnitude metric (no gradients)
+    """
+    H, W = rendered_rgb.shape[:2]
+    device = rendered_rgb.device
+    
+    # Convert to RAFT input format: [B, C, H, W] in [0, 255]
+    rendered_t = (rendered_rgb.detach().permute(2, 0, 1).unsqueeze(0) * 255.0).contiguous()
+    gt_t = (gt_rgb.detach().permute(2, 0, 1).unsqueeze(0) * 255.0).contiguous()
+    
+    # Compute flow from rendered to GT (no gradients - monitoring only)
+    with torch.no_grad():
+        flow, _ = flow_model.calc_flow(rendered_t, gt_t)
+    
+    # Flow shape: [1, 2, H, W] - (u, v) displacement
+    flow = flow.squeeze(0).permute(1, 2, 0)  # [H, W, 2]
+    
+    # Compute magnitude of flow in masked region
+    # Ideally, if render matches GT, flow should be zero
+    flow_magnitude = torch.sqrt(flow[..., 0]**2 + flow[..., 1]**2 + 1e-8)
+    
+    # Mean flow magnitude in masked region (monitoring metric)
+    masked_flow_mag = flow_magnitude[mask]
+    if masked_flow_mag.numel() > 0:
+        flow_metric = masked_flow_mag.mean()
+    else:
+        flow_metric = torch.tensor(0.0, device=device)
+    
+    return flow_metric
 
 
 # Skip sam3d_objects initialization for lightweight tools
@@ -49,7 +143,6 @@ os.environ['LIDRA_SKIP_INIT'] = '1'
 # Add parent directory to path to import sam3d_objects
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from inference import make_scene
 from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.gaussian_model import Gaussian
 from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
 
@@ -552,6 +645,155 @@ def save_mesh_to_obj(mesh, output_path):
             f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
     
     print(f"Saved mesh to {output_path} ({len(verts)} vertices, {len(faces)} faces)")
+
+
+def save_temporal_point_cloud(output_dir, scene_name, suffix=""):
+    """
+    Initialize a temporal point cloud storage structure.
+    
+    Returns a dictionary that can accumulate per-frame point clouds,
+    then be saved to disk.
+    
+    Parameters
+    ----------
+    output_dir : str
+        Directory to save the point cloud
+    scene_name : str
+        Name of the scene
+    suffix : str
+        Suffix for output filename
+        
+    Returns
+    -------
+    dict
+        Storage structure with 'frames' list and metadata
+    """
+    return {
+        'output_dir': output_dir,
+        'scene_name': scene_name,
+        'suffix': suffix,
+        'frames': [],  # List of (frame_idx, xyz, rgb, scales, opacities)
+    }
+
+
+def add_frame_to_temporal_point_cloud(storage, frame_idx, scene_gs):
+    """
+    Add a frame's Gaussian data to the temporal point cloud storage.
+    
+    Parameters
+    ----------
+    storage : dict
+        Storage structure from save_temporal_point_cloud
+    frame_idx : int
+        Frame index
+    scene_gs : Gaussian
+        Gaussian scene object (already in R3/world convention)
+    """
+    # Extract point cloud data from Gaussian
+    xyz = scene_gs.get_xyz.detach().cpu().numpy()  # (N, 3)
+    
+    # Get colors from SH features (assuming DC component only for visualization)
+    features = scene_gs.get_features.detach().cpu().numpy()  # (N, K, 3) or (N, 3)
+    if features.ndim == 3:
+        # Use DC component (first SH band)
+        sh_dc = features[:, 0, :]  # (N, 3)
+    else:
+        sh_dc = features
+    # Convert SH to RGB
+    rgb = sh_dc * 0.28209479177387814 + 0.5  # SH2RGB
+    rgb = np.clip(rgb, 0, 1)
+    
+    # Get scales and opacities for optional filtering
+    scales = scene_gs.get_scaling.detach().cpu().numpy()  # (N, 3)
+    opacities = scene_gs.get_opacity.detach().cpu().numpy()  # (N, 1)
+    
+    storage['frames'].append({
+        'frame_idx': frame_idx,
+        'xyz': xyz.astype(np.float32),
+        'rgb': rgb.astype(np.float32),
+        'scales': scales.astype(np.float32),
+        'opacities': opacities.astype(np.float32),
+    })
+
+
+def finalize_temporal_point_cloud(storage):
+    """
+    Save the temporal point cloud to disk.
+    
+    Saves:
+    - A combined .npz file with all frames
+    - A metadata JSON file
+    
+    Parameters
+    ----------
+    storage : dict
+        Storage structure with accumulated frames
+    save_combined : bool
+        Whether to also save a combined file with all frames
+        
+    Returns
+    -------
+    str
+        Path to the output directory
+    """
+    output_dir = storage['output_dir']
+    scene_name = storage['scene_name']
+    suffix = storage['suffix']
+    
+    # Create point cloud output directory
+    pc_dir = os.path.join(output_dir, "point_clouds")
+    os.makedirs(pc_dir, exist_ok=True)
+    
+    # Save combined file
+    if len(storage['frames']) > 0:
+        combined_filename = f"{scene_name}_temporal{suffix}.npz"
+        combined_filepath = os.path.join(pc_dir, combined_filename)
+        
+        # Combine all frames into arrays
+        all_xyz = []
+        all_rgb = []
+        all_frame_ids = []
+        all_scales = []
+        all_opacities = []
+        
+        for frame_data in storage['frames']:
+            n_points = len(frame_data['xyz'])
+            all_xyz.append(frame_data['xyz'])
+            all_rgb.append(frame_data['rgb'])
+            all_frame_ids.append(np.full(n_points, frame_data['frame_idx'], dtype=np.int32))
+            all_scales.append(frame_data['scales'])
+            all_opacities.append(frame_data['opacities'])
+        
+        np.savez_compressed(
+            combined_filepath,
+            xyz=np.concatenate(all_xyz, axis=0),
+            rgb=np.concatenate(all_rgb, axis=0),
+            frame_ids=np.concatenate(all_frame_ids, axis=0),
+            scales=np.concatenate(all_scales, axis=0),
+            opacities=np.concatenate(all_opacities, axis=0),
+            num_frames=len(storage['frames']),
+            frame_indices=np.array([f['frame_idx'] for f in storage['frames']], dtype=np.int32)
+        )
+        print(f"Saved combined temporal point cloud to {combined_filepath}")
+    
+    # Save metadata
+    metadata = {
+        'scene_name': scene_name,
+        'suffix': suffix,
+        'num_frames': len(storage['frames']),
+        'frame_indices': [f['frame_idx'] for f in storage['frames']],
+        'total_points': sum(len(f['xyz']) for f in storage['frames']),
+    }
+    
+    metadata_path = os.path.join(pc_dir, f"{scene_name}_temporal{suffix}_metadata.json")
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"Saved {len(storage['frames'])} frames to {pc_dir}")
+    print(f"  Total points: {metadata['total_points']}")
+    
+    return pc_dir
+
 
 C0 = 0.28209479177387814
 
@@ -1205,6 +1447,49 @@ def redecode_slat(pipeline, slat, formats=["gaussian", "mesh"]):
     return decoded_outputs
 
 
+def find_best_canon_frame(tokens_list, dataset_path, scene_name, dataset_type, obj_idx):
+    """
+    Find the frame with the highest mask coverage for an object.
+    
+    Returns the frame index with the maximum pixel count in the object's mask.
+    """
+    best_frame = tokens_list[0][0]  # Default to first available frame
+    best_mask_area = 0
+    
+    for frame_idx, decoder_input in tokens_list:
+        mask_area = 0
+        
+        if dataset_type == "kubric4d":
+            frames_path = os.path.join(dataset_path, scene_name, "frames_p0_v0")
+            mask_files = sorted([f for f in os.listdir(frames_path) if f.startswith("segmentation_") and f.endswith(".png")])
+            
+            if frame_idx < len(mask_files):
+                mask_path = os.path.join(frames_path, mask_files[frame_idx])
+                masks = load_masks(mask_path)
+                
+                if obj_idx < len(masks):
+                    mask = masks[obj_idx]
+                    mask_area = np.count_nonzero(mask)
+                    
+        elif dataset_type == "davis":
+            masks_path = os.path.join(dataset_path, "Annotations", "Full-Resolution", scene_name)
+            mask_files = sorted([f for f in os.listdir(masks_path) if f.endswith(".png")])
+            
+            if frame_idx < len(mask_files):
+                mask_path = os.path.join(masks_path, mask_files[frame_idx])
+                masks = load_masks(mask_path)
+                
+                if obj_idx < len(masks):
+                    mask = masks[obj_idx]
+                    mask_area = np.count_nonzero(mask)
+        
+        if mask_area > best_mask_area:
+            best_mask_area = mask_area
+            best_frame = frame_idx
+    
+    return best_frame, best_mask_area
+
+
 def compute_frame_weights_from_masks(tokens_list, dataset_path, scene_name, dataset_type, obj_idx):
     """
     Compute frame weights based on object mask visibility.
@@ -1603,6 +1888,10 @@ def apply_median_scale_to_tokens(tokens_by_object):
     and replaces each frame's scale with that median. This provides more
     consistent object sizing across the sequence.
     
+    When changing scale, the translation (z-depth) is also adjusted to maintain
+    constant projected size in the image. The relationship is:
+        z_new = z_old * (s_new / s_old)
+    
     Parameters
     ----------
     tokens_by_object : dict
@@ -1634,12 +1923,47 @@ def apply_median_scale_to_tokens(tokens_by_object):
         print(f"  Object {obj_idx}: median scale = {median_scale}")
         print(f"    Scale range: min={scales.min(axis=0)}, max={scales.max(axis=0)}")
         
-        # Apply median scale to all frames
-        for frame_idx, decoder_input in tokens_list:
+        # Apply median scale to all frames and adjust translation accordingly
+        for i, (frame_idx, decoder_input) in enumerate(tokens_list):
+            # Get original scale (scalar value - flatten and use first component)
+            old_scale = scales[i].flatten()
+            old_scale_scalar = float(old_scale[0])  # Assume uniform scale, take first component
+            
+            new_scale_flat = median_scale.flatten() if hasattr(median_scale, 'flatten') else np.array([median_scale]).flatten()
+            new_scale_scalar = float(new_scale_flat[0])
+            
+            # Avoid division by zero
+            if abs(old_scale_scalar) < 1e-8:
+                print(f"    Warning: Frame {frame_idx} has near-zero scale, skipping depth adjustment")
+                scale_ratio = 1.0
+            else:
+                scale_ratio = new_scale_scalar / old_scale_scalar
+            
+            # Adjust translation z-component to maintain constant projected size
+            # z_new = z_old * (s_new / s_old)
+            translation = decoder_input['translation']
+            if isinstance(translation, torch.Tensor):
+                old_z = translation[..., 2].item() if translation.dim() > 1 else translation[2].item()
+                new_z = old_z * scale_ratio
+                if translation.dim() > 1:
+                    translation[..., 2] = new_z
+                else:
+                    translation[2] = new_z
+            else:
+                old_z = float(np.array(translation).flatten()[2])
+                new_z = old_z * scale_ratio
+                translation_arr = np.array(translation)
+                translation_arr.flat[2] = new_z
+                decoder_input['translation'] = translation_arr.reshape(np.array(translation).shape)
+            
+            # Apply median scale
             if isinstance(decoder_input['scale'], torch.Tensor):
                 decoder_input['scale'] = torch.tensor(median_scale, dtype=decoder_input['scale'].dtype, device=decoder_input['scale'].device)
             else:
                 decoder_input['scale'] = median_scale
+            
+            if i == 0:  # Print adjustment info for first frame only
+                print(f"    Example (frame {frame_idx}): scale_ratio={scale_ratio:.4f}, z: {old_z:.4f} -> {new_z:.4f}")
     
     return tokens_by_object
 
@@ -1709,7 +2033,7 @@ def compute_and_cache_frame_tokens(
     cache_parts = [args.scene_name, f"f{frame_index}"]
     if args.object_index is not None:
         cache_parts.append(f"obj{args.object_index}")
-    if not args.no_background:
+    if args.background:
         cache_parts.append("bg")
     cache_scene_name = "_".join(cache_parts)
     
@@ -1756,7 +2080,7 @@ def ensure_all_frames_have_tokens(
     # First, load existing tokens
     tokens_by_object = load_all_frame_tokens(
         tokens_dir, args.scene_name,
-        args.object_index, not args.no_background
+        args.object_index, args.background
     )
     
     # Find which frames already have tokens
@@ -1829,7 +2153,7 @@ def render_gaussian_params(
     Returns
     -------
     tuple
-        (rgb, alpha, depth) where rgb is the rendered image (H, W, 3)
+        (rgb, alpha, depth) where rgb is the rendered image (H, W, 3), alpha is (H, W), and depth is (H, W)
     """
     device = means.device
     
@@ -2030,6 +2354,16 @@ def refine_pose_for_frame(
     else:
         mask = mask.bool().to(device)
     
+    # Load flow model if flow loss is enabled
+    flow_model = None
+    if config.use_flow:
+        if config.flow_model is not None:
+            flow_model = config.flow_model
+        else:
+            print("      Loading flow model for correspondence loss...")
+            flow_model = _get_flow_model()
+            config.flow_model = flow_model  # Cache for future use
+    
     # Initialize optimizable parameters
     # Use a 6D rotation representation for better optimization, or just optimize quaternion directly
     opt_rotation = initial_rotation.clone().detach().requires_grad_(True)
@@ -2045,18 +2379,16 @@ def refine_pose_for_frame(
         initial_scale_scalar = initial_scale_flat[:1]
     
     # Handle scale refinement based on config
-    if config.refine_scale == "global":
-        raise NotImplementedError(
-            "Global scale refinement (optimizing a single scale across all frames) "
-            "is not implemented yet. Use 'none' or 'perframe' instead."
-        )
+    # Note: "global" scale refinement is handled at the sequence level by refine_poses_global_scale()
+    # This function only handles "none" and "perframe" modes
     
     # Set up scale parameter based on refinement mode
     if config.refine_scale == "perframe":
         # Optimize scale independently for each frame
         opt_scale_scalar = initial_scale_scalar.clone().detach().requires_grad_(True)
     else:
-        # config.refine_scale == "none": Do not optimize scale
+        # config.refine_scale == "none" or "global": Do not optimize scale here
+        # (for "global", scale is optimized at sequence level)
         opt_scale_scalar = initial_scale_scalar.clone().detach().requires_grad_(False)
     
     # Create optimizer with different learning rates
@@ -2073,15 +2405,6 @@ def refine_pose_for_frame(
     # Background color (white for evaluation)
     bg_color = torch.zeros(3, device=device)
     
-    # # Get Gaussian attributes (frozen)
-    # with torch.no_grad():
-    #     xyz_local = canonical_gs.get_xyz.clone()
-    #     rot_local = canonical_gs.get_rotation.clone()
-    #     scales_local = canonical_gs.get_scaling.clone()
-    #     opacities = canonical_gs.get_opacity.clone()
-    #     features = canonical_gs.get_features.clone()
-    #     # Note: features shape is (N, 1, 3) or (N, K, 3) - render_gaussian_params handles this
-    
     best_loss = float('inf')
     best_params = {}
     best_iteration = 0
@@ -2090,116 +2413,20 @@ def refine_pose_for_frame(
     for iteration in range(config.num_iterations):
         optimizer.zero_grad()
         
-        # TODO: need to detach?
-        transformed_xyz, transformed_rot, transformed_scales, opacities, features = apply_pose_to_gaussian(
-            canonical_gs=canonical_gs,
-            rotation=opt_rotation,
-            translation=opt_translation,
-            scale=opt_scale_scalar
+        # Render frame with current pose
+        rgb, alpha, depth = _render_frame_with_pose(canonical_gs, opt_rotation, opt_translation, opt_scale_scalar, K_matrix, W, H, device)
+        
+        # Compute RGB, silhouette, and flow loss using shared helper
+        losses_dict = _compute_frame_loss(
+            rgb, alpha, gt_image, mask, config, flow_model
         )
-        
-        # Transform from PyTorch3D convention to R3 convention
-        # Camera convention transformation (R3 -> PyTorch3D)
-        r3_to_p3d_R, r3_to_p3d_T = look_at_view_transform(
-            eye=np.array([[0, 0, -1]]),
-            at=np.array([[0, 0, 0]]),
-            up=np.array([[0, -1, 0]]),
-            device=device,
-        )
-        
-        # Inverse transform (PyTorch3D -> R3)
-        p3d_to_r3_R = r3_to_p3d_R.transpose(1, 2)
-        
-        # Transform positions
-        camera_convention_transform = Transform3d(device=device).rotate(p3d_to_r3_R)
-        transformed_xyz = camera_convention_transform.transform_points(transformed_xyz)
-        
-        # Transform rotations (quaternions)
-        # Convert rotation matrix to quaternion (PyTorch3D uses wxyz format)
-        p3d_to_r3_quat = matrix_to_quaternion(p3d_to_r3_R)  # (1, 4) in wxyz format
-        
-        # Multiply quaternions: q_new = q_transform * q_original
-        transformed_rot = quaternion_multiply(
-            p3d_to_r3_quat.expand(transformed_rot.shape[0], -1),
-            transformed_rot
-        )
-        
-        # Handle opacities
-        opacities_flat = opacities.squeeze(-1) if opacities.dim() == 2 else opacities
-        
-        # C2W 
-        c2w = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0)  # [1, 4, 4]
-        
-        # Render
-        rgb, alpha, depth = render_gaussian_params(
-            transformed_xyz,
-            transformed_rot,
-            transformed_scales,
-            opacities_flat,
-            features,
-            c2w,
-            K_matrix,
-            W, H,
-            bg_color=bg_color
-        )
-        
-        # Compute loss in masked region only
-        
-        # MSE loss
-        diff = (rgb - gt_image) ** 2
-        
-        # # DEBUG: Visualize rendered and gt_image and diff
-        # fig = plt.figure()
-        # plt.subplot(1, 3, 1)
-        # plt.title("Rendered")
-        # plt.imshow(rgb.detach().cpu().numpy())
-        # plt.axis('off')
-        # plt.subplot(1, 3, 2)
-        # plt.title("Ground Truth")
-        # plt.imshow(gt_image.detach().cpu().numpy())
-        # plt.axis('off')
-        # plt.subplot(1, 3, 3)
-        # plt.title("Diff")
-        # plt.imshow(diff.detach().cpu().numpy())
-        # plt.axis('off')
-        # plt.savefig("refine_pose_diff_debug.png")
-        # plt.close(fig)
-        
-        # # DEBUG: Visualize rendered alpha and mask and their difference
-        # fig = plt.figure()
-        # plt.subplot(1, 3, 1)
-        # plt.title("Rendered Alpha")
-        # plt.imshow(alpha.detach().cpu().numpy(), cmap='gray')
-        # plt.axis('off')
-        # plt.subplot(1, 3, 2)
-        # plt.title("Mask")
-        # plt.imshow(mask.detach().cpu().numpy(), cmap='gray')
-        # plt.axis('off')
-        # plt.subplot(1, 3, 3)
-        # plt.title("Alpha - Mask")
-        # plt.imshow((alpha - mask.float()).detach().cpu().numpy(), cmap='gray')
-        # plt.axis('off')
-        # plt.savefig("refine_pose_alpha_mask_debug.png")
-        # plt.close(fig)
-        
-        # exit(0)
-        
-        masked_diff = diff[mask]
-        rgb_loss = masked_diff.mean()
-        
-        # Silhouette loss: encourage rendered alpha to match the object mask
-        # alpha is (1, H, W), mask is (H, W) boolean
-        alpha_squeezed = alpha.squeeze(0)  # (H, W)
-        mask_float = mask.float()  # Convert boolean mask to float (0 or 1)
-        
-        # Binary cross-entropy between rendered alpha and GT mask
-        # Clamp alpha to avoid log(0)
-        alpha_clamped = torch.clamp(alpha_squeezed, 1e-6, 1.0 - 1e-6)
-        silhouette_loss = -(mask_float * torch.log(alpha_clamped) + 
-                           (1 - mask_float) * torch.log(1 - alpha_clamped)).mean()
-        
-        # Weight for silhouette loss
-        weighted_silhouette_loss = config.silhouette_weight * silhouette_loss
+        rgb_loss = losses_dict["rgb_loss"]
+        silhouette_loss = losses_dict["silhouette_loss"]
+        # flow_loss = losses_dict["flow_loss"]
+        rgb_loss_value = rgb_loss.mean()
+        silhouette_loss_value = silhouette_loss.mean()
+        flow_loss_value = torch.tensor(0.0, device=device)
+        base_loss = rgb_loss_value + silhouette_loss_value # + flow_loss_value
         
         # Debug: Check if rendered object overlaps with mask
         if iteration == 0 and config.verbose:
@@ -2209,26 +2436,53 @@ def refine_pose_for_frame(
                 bg_in_mask = bg_color.expand(rendered_in_mask.shape[0], -1)
                 non_bg_mask = (rendered_in_mask - bg_in_mask).abs().sum(dim=-1) > 0.01
                 print(f"      [Overlap check] Mask pixels: {mask.sum().item()}, Non-background in mask: {non_bg_mask.sum().item()} ({100*non_bg_mask.float().mean().item():.1f}%)")
+                
+                # TODO: keep working on this later
+                # if config.flow_weight > 0:
+                #     print(f"      [Flow loss] weight={config.flow_weight}, loss={weighted_flow_loss.item():.6f}")
+        
+        # DEBUG: save visuals of the losses (rgb, silhouette)
+        if iteration % 10 == 0:
+            # convert to numpy
+            rgb_loss_np = rgb_loss.detach().cpu().numpy()
+            silh_loss_np = silhouette_loss.detach().cpu().numpy()
+            fig = plt.figure(figsize=(12, 4))
+            ax1 = fig.add_subplot(1, 3, 1)
+            ax1.imshow(rgb_loss_np, cmap='hot')
+            ax1.set_title('RGB Loss')
+            ax2 = fig.add_subplot(1, 3, 2)
+            ax2.imshow(silh_loss_np, cmap='hot')
+            ax2.set_title('Silhouette Loss')
+            ax3 = fig.add_subplot(1, 3, 3)
+            ax3.imshow(mask.detach().cpu().numpy(), cmap='gray')
+            ax3.set_title('Mask')
+            plt.tight_layout()
+            plt.savefig(f"debug_frame_refinement_iter{iteration}.png")
+            plt.close(fig)
         
         # Optional: add regularization to prevent large deviations from initial pose
-        opt_rotation_normalized = opt_rotation / opt_rotation.norm()
-        reg_rot = ((opt_rotation_normalized - initial_rotation / initial_rotation.norm()) ** 2).sum()
-        reg_trans = ((opt_translation - initial_translation) ** 2).sum()
-        # Only add scale regularization if scale is being optimized
-        if config.refine_scale == "perframe":
-            reg_scale = ((opt_scale_scalar - initial_scale_scalar) ** 2).sum()
-            weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans + reg_scale)
+        if config.use_regularization:
+            opt_rotation_normalized = opt_rotation / opt_rotation.norm()
+            reg_rot = ((opt_rotation_normalized - initial_rotation / initial_rotation.norm()) ** 2).sum()
+            reg_trans = ((opt_translation - initial_translation) ** 2).sum()
+            # Only add scale regularization if scale is being optimized
+            if config.refine_scale == "perframe":
+                reg_scale = ((opt_scale_scalar - initial_scale_scalar) ** 2).sum()
+                weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans + reg_scale)
+            else:
+                weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans)
         else:
-            weighted_reg_loss = config.regularization_weight * (reg_rot + reg_trans)
+            weighted_reg_loss = torch.tensor(0.0, device=device)
         
-        # Total loss
-        loss = rgb_loss + weighted_silhouette_loss + weighted_reg_loss
+        # Total loss (base_loss already includes rgb + silhouette + flow)
+        loss = base_loss + weighted_reg_loss
         
         # Record loss for this iteration (both total and individual terms)
         loss_history.append({
             'total': loss.item(),
-            'rgb': rgb_loss.item(),
-            'silhouette': weighted_silhouette_loss.item(),
+            'rgb': rgb_loss_value.item(),
+            'silhouette': silhouette_loss_value.item(),
+            'flow': flow_loss_value.item(),
             'regularization': weighted_reg_loss.item(),
         })
         
@@ -2245,8 +2499,7 @@ def refine_pose_for_frame(
                 scale_grad = opt_scale_scalar.grad
                 print(f"      [Gradient check] scale grad: {scale_grad.abs().max().item() if scale_grad is not None else 'None':.6e}")
             else:
-                print(f"      [Gradient check] scale grad: N/A (scale refinement disabled)")
-            print(f"      [Gradient check] transformed_xyz requires_grad: {transformed_xyz.requires_grad}")
+                print("      [Gradient check] scale grad: N/A (scale refinement disabled)")
             print(f"      [Gradient check] rgb requires_grad: {rgb.requires_grad}")
             print(f"      [Gradient check] loss requires_grad: {loss.requires_grad}")
         
@@ -2265,8 +2518,8 @@ def refine_pose_for_frame(
             }
         
         if config.verbose and (iteration % config.log_interval == 0 or iteration == config.num_iterations - 1):
-            print(f"      Iteration {iteration}: total={loss.item():.6f} rgb={rgb_loss.item():.6f} "
-                  f"silh={weighted_silhouette_loss.item():.6f} reg={weighted_reg_loss.item():.8f}")
+            print(f"      Iteration {iteration}: total={loss.item():.6f} rgb={rgb_loss_value.item():.6f} "
+                  f"silh={silhouette_loss_value.item():.6f} reg={weighted_reg_loss.item():.8f}")
     
     if config.verbose:
         print(f"      Best loss: {best_loss:.6f} (iteration {best_iteration})")
@@ -2314,6 +2567,433 @@ def decode_per_frame_gaussians(tokens_by_object, pipeline):
     return canonical_gaussians_per_frame
 
 
+def _prepare_frame_data_for_refinement(args, paths, frame_idx, obj_idx, inference):
+    """
+    Load and prepare frame data for refinement.
+    
+    Returns
+    -------
+    dict or None
+        Dictionary with 'image', 'mask', 'K_matrix', 'H', 'W' or None if data unavailable
+    """
+    image_path = os.path.join(paths['frames_path'], paths['image_names'][frame_idx])
+    mask_path = os.path.join(paths['masks_path'], paths['mask_names'][frame_idx])
+    
+    image = load_image(image_path)
+    image = image[..., :3]
+    H, W, _ = image.shape
+    
+    masks = load_masks(mask_path)
+    if args.object_index is not None:
+        masks = [masks[args.object_index]]
+    
+    # Get the mask for this object
+    if obj_idx >= len(masks):
+        return None
+    mask = masks[obj_idx]
+    
+    # Load depth and compute K_matrix
+    depth_names_for_frame = []
+    if paths['dataset_type'] == 'kubric4d' and paths['depth_names']:
+        depth_names_for_frame = [paths['depth_names'][frame_idx]]
+    
+    pointmap, K_matrix, valid_mask = load_and_process_depth(
+        paths['frames_path'],
+        depth_names_for_frame,
+        W, H,
+        use_moge=args.use_moge,
+        inference=inference,
+        image=image
+    )
+    
+    return {
+        'image': image,
+        'mask': mask,
+        'K_matrix': K_matrix,
+        'H': H,
+        'W': W,
+    }
+
+
+def _render_frame_with_pose(canonical_gs, rotation, translation, scale, K_matrix, W, H, device):
+    """
+    Render a single frame with given pose parameters.
+    
+    Returns
+    -------
+    tuple
+        (rgb, alpha, depth) where rgb is (H, W, 3) and alpha is (H, W), depth is (H, W)
+    """
+    # Apply pose to canonical Gaussian
+    transformed_xyz, transformed_rot, transformed_scales, opacities, features = apply_pose_to_gaussian(
+        canonical_gs=canonical_gs,
+        rotation=rotation,
+        translation=translation,
+        scale=scale
+    )
+    
+    # Transform from PyTorch3D convention to R3 convention
+    r3_to_p3d_R, r3_to_p3d_T = look_at_view_transform(
+        eye=np.array([[0, 0, -1]]),
+        at=np.array([[0, 0, 0]]),
+        up=np.array([[0, -1, 0]]),
+        device=device,
+    )
+    
+    # Inverse transform (PyTorch3D -> R3)
+    p3d_to_r3_R = r3_to_p3d_R.transpose(1, 2)
+    
+    # Transform positions
+    camera_convention_transform = Transform3d(device=device).rotate(p3d_to_r3_R)
+    transformed_xyz = camera_convention_transform.transform_points(transformed_xyz)
+    
+    # Transform rotations (quaternions)
+    p3d_to_r3_quat = matrix_to_quaternion(p3d_to_r3_R)
+    transformed_rot = quaternion_multiply(
+        p3d_to_r3_quat.expand(transformed_rot.shape[0], -1),
+        transformed_rot
+    )
+    
+    # Handle opacities
+    opacities_flat = opacities.squeeze(-1) if opacities.dim() == 2 else opacities
+    
+    # C2W 
+    c2w = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0)
+    
+    # Background color
+    bg_color = torch.zeros(3, device=device)
+    
+    # Render
+    rgb, alpha, depth = render_gaussian_params(
+        transformed_xyz,
+        transformed_rot,
+        transformed_scales,
+        opacities_flat,
+        features,
+        c2w,
+        K_matrix,
+        W, H,
+        bg_color=bg_color
+    )
+    
+    return rgb, alpha, depth
+
+
+def _compute_frame_loss(rgb, alpha, gt_image, mask, config, flow_model=None):
+    """
+    Compute loss for a single frame.
+    
+    Parameters
+    ----------
+    rgb : torch.Tensor
+        Rendered RGB image (H, W, 3)
+    alpha : torch.Tensor
+        Rendered alpha/opacity (1, H, W)
+    gt_image : torch.Tensor
+        Ground truth image (H, W, 3)
+    mask : torch.Tensor
+        Object mask (H, W), boolean
+    config : RefinementConfig
+        Refinement configuration
+    flow_model : optional
+        Pre-loaded flow model for correspondence loss
+    
+    Returns
+    -------
+    tuple
+        (total_loss, rgb_loss, silhouette_loss, flow_loss)
+    """
+    # device = rgb.device
+    
+    # MSE loss in masked region
+    diff = (rgb - gt_image) ** 2
+    
+    # set diff to 0 outside mask
+    masked_diff = diff * mask.unsqueeze(-1)
+    
+    # RGB loss
+    rgb_loss = masked_diff
+    
+    # Silhouette loss
+    alpha_squeezed = alpha.squeeze(0)
+    mask_float = mask.float()
+    alpha_clamped = torch.clamp(alpha_squeezed, 1e-6, 1.0 - 1e-6)
+    silhouette_loss = -(mask_float * torch.log(alpha_clamped) + 
+                       (1 - mask_float) * torch.log(1 - alpha_clamped))
+    weighted_silhouette_loss = config.silhouette_weight * silhouette_loss
+    
+    # TODO: Flow correspondence loss (if enabled)
+    # if config.use_flow and flow_model is not None:
+    #     flow_loss = _compute_flow_loss(rgb, gt_image, mask, flow_model)
+    #     weighted_flow_loss = config.flow_weight * flow_loss
+    # else:
+    # flow_loss = torch.tensor(0.0, device=device)
+    # weighted_flow_loss = torch.tensor(0.0, device=device)
+    
+    return {
+        "rgb_loss": rgb_loss,
+        "silhouette_loss": weighted_silhouette_loss,
+        # "flow_loss": weighted_flow_loss,
+    }
+
+
+def refine_poses_global_scale(
+    canonical_gs,
+    tokens_list,
+    obj_idx,
+    args, paths, inference,
+    config: RefinementConfig,
+):
+    """
+    Refine poses for a single object with global scale optimization.
+    
+    This function optimizes:
+    - Per-frame rotation and translation
+    - A single global scale shared across all frames (initialized from first frame)
+    
+    The optimization is batch-based, aggregating loss over multiple frames per iteration.
+    
+    Parameters
+    ----------
+    canonical_gs : Gaussian
+        The canonical Gaussian for this object
+    tokens_list : list
+        List of (frame_index, decoder_input) tuples for this object
+    obj_idx : int
+        Object index (for logging)
+    args : argparse.Namespace
+        Command line arguments
+    paths : dict
+        Dataset paths
+    inference : Inference
+        Inference pipeline (for depth estimation if needed)
+    config : RefinementConfig
+        Configuration for refinement hyperparameters
+        
+    Returns
+    -------
+    list
+        Refined list of (frame_index, decoder_input) tuples with updated poses
+    """
+    device = torch.device('cuda')
+    num_frames = len(tokens_list)
+    
+    if num_frames == 0:
+        return []
+    
+    print(f"\n    Refining object {obj_idx} with global scale ({num_frames} frames)")
+    
+    # Load all frame data upfront
+    frame_data = {}
+    valid_frame_indices = []
+    
+    for frame_idx, decoder_input in tokens_list:
+        data = _prepare_frame_data_for_refinement(args, paths, frame_idx, obj_idx, inference)
+        if data is not None:
+            frame_data[frame_idx] = {
+                'gt_image': torch.from_numpy(data['image']).float().cuda() / 255.0,
+                'mask': torch.from_numpy(data['mask']).bool().cuda(),
+                'K_matrix': data['K_matrix'],
+                'H': data['H'],
+                'W': data['W'],
+                'decoder_input': decoder_input,
+            }
+            valid_frame_indices.append(frame_idx)
+        else:
+            print(f"      Warning: Could not load data for frame {frame_idx}, skipping")
+    
+    if len(valid_frame_indices) == 0:
+        print(f"      No valid frames for object {obj_idx}")
+        return tokens_list
+    
+    # Initialize optimizable parameters
+    # Per-frame: rotation (1, 4) and translation (1, 3)
+    # Global: scale (scalar)
+    
+    opt_rotations = {}  # frame_idx -> tensor
+    opt_translations = {}  # frame_idx -> tensor
+    initial_rotations = {}
+    initial_translations = {}
+    
+    # Use first frame's scale as the reference for global scale
+    first_frame_idx = valid_frame_indices[0]
+    first_decoder_input = frame_data[first_frame_idx]['decoder_input']
+    initial_scale_flat = first_decoder_input['scale'].view(-1)
+    if initial_scale_flat.shape[0] == 3:
+        initial_scale_scalar = initial_scale_flat.mean().view(1)
+    else:
+        initial_scale_scalar = initial_scale_flat[:1]
+    
+    # Global scale parameter
+    opt_global_scale = initial_scale_scalar.clone().detach().to(device).requires_grad_(True)
+    
+    print(f"      Initial global scale (from frame {first_frame_idx}): {opt_global_scale.item():.6f}")
+    
+    # Initialize per-frame parameters
+    for frame_idx in valid_frame_indices:
+        decoder_input = frame_data[frame_idx]['decoder_input']
+        
+        initial_rotations[frame_idx] = decoder_input['rotation'].clone().detach().to(device)
+        initial_translations[frame_idx] = decoder_input['translation'].clone().detach().to(device)
+        
+        opt_rotations[frame_idx] = decoder_input['rotation'].clone().detach().to(device).requires_grad_(True)
+        opt_translations[frame_idx] = decoder_input['translation'].clone().detach().to(device).requires_grad_(True)
+    
+    # Create optimizer with all parameters
+    param_groups = [
+        {'params': [opt_global_scale], 'lr': config.lr_scale},
+    ]
+    for frame_idx in valid_frame_indices:
+        param_groups.append({'params': [opt_rotations[frame_idx]], 'lr': config.lr_rotation})
+        param_groups.append({'params': [opt_translations[frame_idx]], 'lr': config.lr_translation})
+    
+    optimizer = torch.optim.Adam(param_groups)
+    
+    # Determine batch size
+    batch_size = config.batch_size if config.batch_size > 0 else len(valid_frame_indices)
+    batch_size = min(batch_size, len(valid_frame_indices))
+    
+    print(f"      Batch size: {batch_size} (out of {len(valid_frame_indices)} frames)")
+    
+    # Track best parameters
+    best_loss = float('inf')
+    best_params = {}
+    best_iteration = 0
+    loss_history = []
+    
+    for iteration in range(config.num_iterations):
+        optimizer.zero_grad()
+        
+        # Sample batch of frames (or use all if batch_size >= num_frames)
+        if batch_size >= len(valid_frame_indices):
+            batch_frame_indices = valid_frame_indices
+        else:
+            # Random sampling without replacement
+            batch_frame_indices = list(np.random.choice(
+                valid_frame_indices, size=batch_size, replace=False
+            ))
+        
+        # Accumulate loss over batch
+        total_rgb_loss = 0.0
+        total_silhouette_loss = 0.0
+        total_reg_loss = 0.0
+        
+        for frame_idx in batch_frame_indices:
+            data = frame_data[frame_idx]
+            
+            # Render frame with current parameters
+            rgb, alpha, depth = _render_frame_with_pose(
+                canonical_gs,
+                opt_rotations[frame_idx],
+                opt_translations[frame_idx],
+                opt_global_scale,
+                data['K_matrix'],
+                data['W'],
+                data['H'],
+                device
+            )
+            
+            # Compute frame loss (flow_model=None for global scale refinement)
+            losses_dict = _compute_frame_loss(
+                rgb, alpha, data['gt_image'], data['mask'], config, flow_model=None
+            )
+            
+            rgb_loss = losses_dict["rgb_loss"]
+            silhouette_loss = losses_dict["silhouette_loss"]
+            # flow_loss = losses_dict["flow_loss"]
+            
+            total_rgb_loss += rgb_loss.mean()
+            total_silhouette_loss += silhouette_loss.mean()
+            
+            # Per-frame regularization (optional)
+            if config.use_regularization:
+                opt_rot_normalized = opt_rotations[frame_idx] / opt_rotations[frame_idx].norm()
+                init_rot_normalized = initial_rotations[frame_idx] / initial_rotations[frame_idx].norm()
+                reg_rot = ((opt_rot_normalized - init_rot_normalized) ** 2).sum()
+                reg_trans = ((opt_translations[frame_idx] - initial_translations[frame_idx]) ** 2).sum()
+                total_reg_loss += config.regularization_weight * (reg_rot + reg_trans)
+        
+        # Global scale regularization (optional)
+        if config.use_regularization:
+            scale_reg = ((opt_global_scale - initial_scale_scalar.to(device)) ** 2).sum()
+            total_reg_loss += config.regularization_weight * scale_reg
+        
+        # Average losses over batch
+        batch_rgb_loss = total_rgb_loss / len(batch_frame_indices)
+        batch_silhouette_loss = total_silhouette_loss / len(batch_frame_indices)
+        batch_reg_loss = total_reg_loss / len(batch_frame_indices) if config.use_regularization else torch.tensor(0.0, device=device)
+        
+        # Total loss
+        total_loss = batch_rgb_loss + batch_silhouette_loss + batch_reg_loss
+        
+        # Record loss
+        loss_history.append({
+            'total': total_loss.item(),
+            'rgb': batch_rgb_loss.item(),
+            'silhouette': batch_silhouette_loss.item(),
+            'regularization': batch_reg_loss.item() if config.use_regularization else 0.0,
+        })
+        
+        # Backprop
+        total_loss.backward()
+        
+        # Debug on first iteration
+        if iteration == 0 and config.verbose:
+            print(f"      [Gradient check] global_scale grad: {opt_global_scale.grad.abs().max().item() if opt_global_scale.grad is not None else 'None':.6e}")
+            sample_frame = valid_frame_indices[0]
+            rot_grad = opt_rotations[sample_frame].grad
+            trans_grad = opt_translations[sample_frame].grad
+            print(f"      [Gradient check] sample frame {sample_frame} rotation grad: {rot_grad.abs().max().item() if rot_grad is not None else 'None':.6e}")
+            print(f"      [Gradient check] sample frame {sample_frame} translation grad: {trans_grad.abs().max().item() if trans_grad is not None else 'None':.6e}")
+        
+        optimizer.step()
+        
+        # Track best
+        if total_loss.item() < best_loss:
+            best_loss = total_loss.item()
+            best_iteration = iteration
+            # Store best parameters
+            best_params = {
+                'global_scale': opt_global_scale.clone().detach(),
+                'rotations': {fi: opt_rotations[fi].clone().detach() for fi in valid_frame_indices},
+                'translations': {fi: opt_translations[fi].clone().detach() for fi in valid_frame_indices},
+            }
+        
+        if config.verbose and (iteration % config.log_interval == 0 or iteration == config.num_iterations - 1):
+            print(f"      Iteration {iteration}: total={total_loss.item():.6f} rgb={batch_rgb_loss.item():.6f} "
+                  f"silh={batch_silhouette_loss.item():.6f} reg={batch_reg_loss.item():.8f} "
+                  f"scale={opt_global_scale.item():.6f}")
+    
+    if config.verbose:
+        print(f"      Best loss: {best_loss:.6f} (iteration {best_iteration})")
+        print(f"      Final global scale: {best_params['global_scale'].item():.6f}")
+    
+    # Build refined tokens list
+    refined_tokens_list = []
+    global_scale_3d = best_params['global_scale'].expand(3).reshape(1, 3)
+    
+    for frame_idx, decoder_input in tokens_list:
+        if frame_idx in valid_frame_indices:
+            # Normalize rotation
+            refined_rotation = best_params['rotations'][frame_idx]
+            refined_rotation = refined_rotation / refined_rotation.norm()
+            
+            refined_decoder_input = {
+                'decoder_input_slat': decoder_input['decoder_input_slat'],
+                'rotation': refined_rotation,
+                'translation': best_params['translations'][frame_idx],
+                'scale': global_scale_3d.clone(),
+                'refinement_loss_history': loss_history,
+                'refinement_best_iteration': best_iteration,
+            }
+            refined_tokens_list.append((frame_idx, refined_decoder_input))
+        else:
+            # Frame was skipped, keep original
+            refined_tokens_list.append((frame_idx, decoder_input))
+    
+    return refined_tokens_list
+
+
 def refine_poses_for_sequence(
     canonical_gaussians,
     tokens_by_object,
@@ -2349,6 +3029,44 @@ def refine_poses_for_sequence(
     dict
         Refined tokens_by_object with updated poses
     """
+    # Dispatch to global scale refinement if requested
+    if config.refine_scale == "global":
+        print("\n  Refining poses with GLOBAL scale optimization (batch-based)...")
+        
+        refined_tokens = {}
+        
+        for obj_idx in sorted(tokens_by_object.keys()):
+            # Get canonical Gaussian for this object
+            if per_frame_canonical:
+                # For per-frame canonical, we need to pick one canonical Gaussian
+                # Use the first available frame's canonical Gaussian
+                if obj_idx not in canonical_gaussians or len(canonical_gaussians[obj_idx]) == 0:
+                    print(f"    Warning: No canonical Gaussian for object {obj_idx}, skipping")
+                    refined_tokens[obj_idx] = tokens_by_object[obj_idx]
+                    continue
+                # Use first frame's canonical Gaussian
+                first_frame = min(canonical_gaussians[obj_idx].keys())
+                canonical_gs = canonical_gaussians[obj_idx][first_frame]
+                print(f"    Object {obj_idx}: Using canonical Gaussian from frame {first_frame}")
+            else:
+                if obj_idx not in canonical_gaussians:
+                    print(f"    Warning: No canonical Gaussian for object {obj_idx}, skipping")
+                    refined_tokens[obj_idx] = tokens_by_object[obj_idx]
+                    continue
+                canonical_gs = canonical_gaussians[obj_idx]
+            
+            # Refine with global scale
+            refined_tokens[obj_idx] = refine_poses_global_scale(
+                canonical_gs,
+                tokens_by_object[obj_idx],
+                obj_idx,
+                args, paths, inference,
+                config,
+            )
+        
+        return refined_tokens
+    
+    # Original per-frame refinement logic (for refine_scale="none" or "perframe")
     print("\n  Refining per-frame poses with differentiable rendering...")
     
     refined_tokens = {}
@@ -2455,7 +3173,7 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     """
     # Build cache filename
     cache_filename, cache_scene_name = get_cache_filename(
-        args.scene_name, frame_index, args.object_index, not args.no_background
+        args.scene_name, frame_index, args.object_index, args.background
     )
     cache_file = os.path.join(tokens_dir, cache_filename)
     
@@ -2492,7 +3210,7 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     )
     
     # Keep original pointmap for background
-    pointmap_original = pointmap.copy() if not args.no_background else None
+    pointmap_original = pointmap.copy() if args.background else None
     
     # Load decoder inputs from cache
     decoder_inputs = load_decoder_inputs_from_cache(cache_file)
@@ -2527,7 +3245,7 @@ def process_frame_from_cache(args, paths, frame_index, inference, tokens_dir):
     new_scene_gs = transform_scene_to_r3_convention(scene_gs)
     
     # Add background Gaussians if requested
-    if not args.no_background and pointmap_original is not None:
+    if args.background and pointmap_original is not None:
         background_gs = create_background_gaussians(
             image, pointmap_original, masks, K_matrix
         )
@@ -2583,7 +3301,7 @@ def process_frame_full_inference(args, paths, frame_index, inference):
         image=image
     )
     
-    pointmap_original = pointmap.copy() if not args.no_background else None
+    pointmap_original = pointmap.copy() if args.background else None
     
     # Transform to PyTorch3D convention
     pointmap = transform_to_pytorch3d_convention(pointmap)
@@ -2596,7 +3314,7 @@ def process_frame_full_inference(args, paths, frame_index, inference):
     new_scene_gs = transform_scene_to_r3_convention(scene_gs)
     
     # Add background if requested
-    if not args.no_background and pointmap_original is not None:
+    if args.background and pointmap_original is not None:
         background_gs = create_background_gaussians(
             image, pointmap_original, masks, K_matrix
         )
@@ -2787,17 +3505,22 @@ def _build_evaluation_summary(
                 'lpip_std': float(obj_metrics['lpip_std']),
             }
     
+    # Determine if using canonical mode
+    canonicalization = getattr(args, 'canonicalization', 'none')
+    use_canonical = canonicalization in ['average', 'pickone']
+    
     summary = {
         'dataset': args.dataset,
         'scene_name': args.scene_name,
         'num_frames_evaluated': len(frame_indices_processed),
         'frame_stride': args.frame_stride,
-        'with_background': not args.no_background,
+        'with_background': args.background,
         'object_index': args.object_index,
-        'average_tokens': args.average_tokens,
-        'weighting_type': args.weighting_type if args.average_tokens else None,
-        'refine_poses': getattr(args, 'refine_poses', False) if args.average_tokens else False,
-        'refine_iterations': getattr(args, 'refine_iterations', None) if (args.average_tokens and getattr(args, 'refine_poses', False)) else None,
+        'canonicalization': canonicalization,
+        'weighting_type': args.weighting_type if canonicalization == 'average' else None,
+        'canon_frame': getattr(args, 'canon_frame', None) if canonicalization == 'pickone' else None,
+        'refine_poses': getattr(args, 'refine_poses', False) if use_canonical else False,
+        'refine_iterations': getattr(args, 'refine_iterations', None) if (use_canonical and getattr(args, 'refine_poses', False)) else None,
         'suffix': suffix,
         # Full-frame summary metrics
         'psnr_mean': float(seq_metrics['psnr_mean']),
@@ -2911,16 +3634,25 @@ def evaluate_with_canonical_objects(
     for obj_idx in range(num_objects):
         per_object_data[obj_idx] = {'rendered': [], 'gt': []}
     
+    # Initialize temporal point cloud storage
+    save_point_clouds = getattr(args, 'save_point_clouds', False)
+    if save_point_clouds:
+        pc_storage = save_temporal_point_cloud(args.output_dir, args.scene_name, suffix)
+    
     # Process each frame
     for frame_idx, frame_index in enumerate(frame_indices_to_process):
         print(f"\n  Processing frame {frame_index} ({frame_idx + 1}/{len(frame_indices_to_process)})")
         
         # Process frame
-        rendered, gt_image, K_matrix, masks = process_frame_with_canonical_object(
+        rendered, gt_image, K_matrix, masks, scene_gs = process_frame_with_canonical_object(
             args, paths, frame_index, inference, tokens_dir,
             canonical_gaussians, tokens_by_object,
             per_frame_canonical=per_frame_canonical
         )
+        
+        # Save point cloud for this frame
+        if save_point_clouds and scene_gs is not None:
+            add_frame_to_temporal_point_cloud(pc_storage, frame_index, scene_gs)
         
         # Convert to format expected by evaluator: (B, C, H, W)
         rendered_eval = rendered.permute(2, 0, 1).unsqueeze(0).to(device)
@@ -2970,6 +3702,10 @@ def evaluate_with_canonical_objects(
             # plt.close(fig)
             # print(f"DEBUG: Saved debug plot to {debug_plot_path}")
             # exit(0)
+    
+    # Finalize and save point clouds
+    if save_point_clouds:
+        finalize_temporal_point_cloud(pc_storage)
             
     # Evaluate and build summary using common function
     return _build_evaluation_summary(
@@ -3026,7 +3762,7 @@ def evaluate_with_canonical_objects(
     #     'scene_name': args.scene_name,
     #     'num_frames_evaluated': len(frame_indices_processed),
     #     'frame_stride': args.frame_stride,
-    #     'with_background': not args.no_background,
+    #     'with_background': args.background,
     #     'object_index': args.object_index,
     #     'average_tokens': args.average_tokens,
     #     'weighting_type': args.weighting_type if args.average_tokens else None,
@@ -3176,6 +3912,39 @@ def plot_refinement_history(refinement_data, output_path):
     print(f"Saved refinement loss plot to {output_path}")
 
 
+def load_frame_data(args, paths, frame_index):
+    """
+    Load frame data (image, masks, camera) for error map visualization.
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    paths : dict
+        Dataset paths
+    frame_index : int
+        Frame index to load
+        
+    Returns
+    -------
+    dict or None
+        Frame data dictionary with 'image', 'masks', 'K', etc.
+    """
+    try:
+        if args.dataset == "kubric4d":
+            from kubric4d import load_kubric4d_frame
+            return load_kubric4d_frame(paths, args.scene_name, frame_index)
+        elif args.dataset == "davis":
+            from davis import load_davis_frame
+            return load_davis_frame(paths, args.scene_name, frame_index)
+        else:
+            print(f"Unknown dataset: {args.dataset}")
+            return None
+    except Exception as e:
+        print(f"Error loading frame {frame_index}: {e}")
+        return None
+
+
 def process_frame_for_eval(args, paths, frame_index, inference, tokens_dir):
     """
     Process a single frame, using cache if available.
@@ -3200,7 +3969,7 @@ def process_frame_for_eval(args, paths, frame_index, inference, tokens_dir):
         and masks is a list of numpy arrays (H, W) boolean masks per object
     """
     # First try to load from cache
-    if not args.no_cache:
+    if args.use_cache:
         result = process_frame_from_cache(args, paths, frame_index, inference, tokens_dir)
         if result is not None:
             # print info about loaded cache
@@ -3275,7 +4044,7 @@ def process_frame_with_canonical_object(args, paths, frame_index, inference, tok
         image=image
     )
     
-    pointmap_original = pointmap.copy() if not args.no_background else None
+    pointmap_original = pointmap.copy() if args.background else None
     
     # Get per-frame poses from cached tokens
     # Build outputs list with canonical gaussian + per-frame pose
@@ -3321,8 +4090,11 @@ def process_frame_with_canonical_object(args, paths, frame_index, inference, tok
     # Transform scene from PyTorch3D to R3 convention
     new_scene_gs = transform_scene_to_r3_convention(scene_gs)
     
+    # Store scene without background for point cloud export
+    scene_gs_no_bg = new_scene_gs
+    
     # Add background Gaussians if requested
-    if not args.no_background and pointmap_original is not None:
+    if args.background and pointmap_original is not None:
         background_gs = create_background_gaussians(
             image, pointmap_original, masks, K_matrix
         )
@@ -3337,5 +4109,5 @@ def process_frame_with_canonical_object(args, paths, frame_index, inference, tok
     # Clamp rendered to [0, 1]
     rendered = torch.clamp(rendered.cpu(), 0.0, 1.0)
     
-    return rendered, gt_image, K_matrix, masks
+    return rendered, gt_image, K_matrix, masks, scene_gs_no_bg
 

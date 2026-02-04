@@ -1,0 +1,52 @@
+# Pose Refinement Configuration
+# ==============================
+# This file contains all hyperparameters for the differentiable
+# rendering-based pose refinement process.
+
+# Optimization settings
+num_iterations: 100
+lr_rotation: 0.01
+lr_translation: 0.001
+lr_scale: 0.001
+
+# Scale refinement mode: "none", "perframe", or "global"
+# - none: Do not refine scale, use initial predicted scale
+# - perframe: Refine scale independently for each frame
+# - global: Optimize a single scale for all frames across the sequence
+refine_scale: "perframe"
+
+# Batch size for global scale refinement (0 or negative = all frames)
+batch_size: 0
+
+# RGB loss configuration
+# Note: GT background is always masked to black for full-image comparison
+rgb_loss_type: "l1"  # "l1" or "l2" (l1 is more robust to outliers)
+rgb_multiscale: true
+rgb_multiscale_scales: [1.0, 0.5, 0.25]
+rgb_multiscale_weights: [0.5, 0.3, 0.2]
+
+# SSIM loss weight (0 = disabled)
+# SSIM captures perceptual similarity and is more robust to small misalignments
+rgb_ssim_weight: 0.1
+
+# Silhouette loss weights
+# The silhouette loss combines three components for robust pose optimization:
+# 1. Center-of-mass loss: directly guides translation
+# 2. Signed distance transform loss: guides all params, escapes local minima
+# 3. Soft IoU loss: fine-grained shape matching once roughly aligned
+silhouette_weight: 0.1  # Master weight (0 = disabled)
+silhouette_com_weight: 1.0
+silhouette_sdt_weight: 0.1
+silhouette_iou_weight: 1.0
+
+# Regularization (penalizes deviation from initial pose)
+use_regularization: false
+regularization_weight: 0.001
+
+# Optical flow correspondence loss
+use_flow: false
+flow_weight: 0.1
+
+# Logging
+verbose: true
+log_interval: 20

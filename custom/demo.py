@@ -45,25 +45,23 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from utils import (
+from custom.utils import (
     setup_paths,
     load_and_process_depth,
     transform_to_pytorch3d_convention,
     run_inference_on_masks,
     transform_scene_to_r3_convention,
     create_background_gaussians,
-    load_image, 
+    load_image,
     load_masks,
     save_tokens,
-    render_and_compare
+    render_and_compare,
+    join_gaussians,
+    save_mesh_to_obj,
 )
 
 import torch
 from inference import Inference, make_scene
-from utils import (
-    join_gaussians,
-    save_mesh_to_obj,
-)
 
 
 
